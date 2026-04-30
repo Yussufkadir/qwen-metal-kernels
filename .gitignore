@@ -1,20 +1,24 @@
 cat > .gitignore << 'EOF'
 
+# Python
 venv/
 __pycache__/
 *.pyc
 *.pyo
 
-/qwen_benchmark/kernel/qwen_kernel/qwen_kernel.xcodeproj
-*.xcuserdata/
-*.xcworkspace/xcuserdata/
+# Xcode
+xcuserdata/
+xcshareddata/
+*.xcworkspace/
 DerivedData/
 build/
 
+# Metal build artifacts
 *.air
 
+# Compiled binaries
 libmetal_kernels.dylib
 
+# System
 .DS_Store
 Thumbs.db
-EOF

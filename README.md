@@ -1,0 +1,1 @@
+Qwen Kernel Optimization for the 0.5b model with metal kernel. this project is for the learning purpose on how writing efficient kernels is done and to probe the knowledge by using small parameter model.
