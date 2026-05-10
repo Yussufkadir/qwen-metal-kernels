@@ -131,5 +131,12 @@ def down_batched(down_w: np.ndarray, x: np.ndarray):
         ctypes.c_uint32(M),
         ctypes.c_uint32(K),
     )
-    
     return out
+
+_lib.run_gate_up_once.argtypes = [
+    ctypes.POINTER(ctypes.c_uint16), ctypes.POINTER(ctypes.c_uint16),
+    ctypes.POINTER(ctypes.c_float), ctypes.POINTER(ctypes.c_float),
+    ctypes.POINTER(ctypes.c_float), ctypes.c_uint32, ctypes.c_uint32,
+    ctypes.c_uint32,
+]
+_lib.run_gate_up_once.restype = ctypes.c_int
