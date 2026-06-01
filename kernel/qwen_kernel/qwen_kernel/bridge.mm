@@ -63,31 +63,31 @@ int run_gate_up_batched(
     static id<MTLBuffer> _cached_x      = nil;
     static id<MTLBuffer> _cached_gate_y = nil;
     static id<MTLBuffer> _cached_up_y   = nil;
-    static uint32_t _cached_size = 0;
-    
+    static size_t _cached_size = 0;
+
     if (!_queue) _queue = [_device newCommandQueue];
-    
+
     size_t weight_bytes = (size_t)BATCH * M * K * sizeof(uint16_t);
     size_t input_bytes  = (size_t)BATCH * K * sizeof(float);
     size_t output_bytes = (size_t)BATCH * M * sizeof(float);
-
     size_t total = weight_bytes + input_bytes + output_bytes;
+
     if (total != _cached_size) {
         _cached_gate_w = [_device newBufferWithLength:weight_bytes options:MTLResourceStorageModeShared];
         _cached_up_w   = [_device newBufferWithLength:weight_bytes options:MTLResourceStorageModeShared];
         _cached_x      = [_device newBufferWithLength:input_bytes options:MTLResourceStorageModeShared];
         _cached_gate_y = [_device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared];
         _cached_up_y   = [_device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared];
-        static size_t _cached_size = total;
+        _cached_size = total;
     }
 
     memcpy([_cached_gate_w contents], gate_w, weight_bytes);
     memcpy([_cached_up_w contents], up_w, weight_bytes);
     memcpy([_cached_x contents], x, input_bytes);
-    
+
     id<MTLCommandBuffer> cmd = [_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    
+
     [enc setComputePipelineState:_pipe_gate_up];
     [enc setBuffer:_cached_gate_w offset:0 atIndex:0];
     [enc setBuffer:_cached_up_w   offset:0 atIndex:1];
@@ -95,30 +95,21 @@ int run_gate_up_batched(
     [enc setBuffer:_cached_gate_y offset:0 atIndex:3];
     [enc setBuffer:_cached_up_y   offset:0 atIndex:4];
     [enc setBytes:&K length:sizeof(uint32_t) atIndex:5];
-    
+
     uint32_t gsize = 128;
     size_t tg_bytes = (gsize / 32) * 2 * sizeof(float);
     [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
-    
+
     MTLSize grid  = MTLSizeMake(M, BATCH, 1);
     MTLSize group = MTLSizeMake(gsize, 1, 1);
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:group];
-    
+
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
 
-    static const void* _last_gate_w = nullptr;
-    if (_last_gate_w != gate_w) {
-        memcpy([_cached_gate_w contents], gate_w, weight_bytes);
-        _last_gate_w = gate_w;
-    }
-    static const void* _last_up_w = nullptr;
-    if (_last_up_w != up_w) {
-        memcpy([_cached_up_w contents], up_w, weight_bytes);
-        _last_up_w = up_w;
-    }
-    memcpy([_cached_x contents], x, input_bytes);
+    memcpy(gate_out, [_cached_gate_y contents], output_bytes);
+    memcpy(up_out,   [_cached_up_y   contents], output_bytes);
     return 0;
 }
 
@@ -136,53 +127,47 @@ int run_down_batched(
     static id<MTLBuffer> _cached_down_w = nil;
     static id<MTLBuffer> _cached_x      = nil;
     static id<MTLBuffer> _cached_out    = nil;
-    static uint32_t _cached_size = 0;
-    
+    static size_t _cached_size = 0;
+
     if (!_queue) _queue = [_device newCommandQueue];
-    
+
     size_t weight_bytes = (size_t)BATCH * M * K * sizeof(uint16_t);
     size_t input_bytes  = (size_t)BATCH * K * sizeof(float);
     size_t output_bytes = (size_t)BATCH * M * sizeof(float);
-
     size_t total = weight_bytes + input_bytes + output_bytes;
+
     if (total != _cached_size) {
         _cached_down_w = [_device newBufferWithLength:weight_bytes options:MTLResourceStorageModeShared];
         _cached_x      = [_device newBufferWithLength:input_bytes  options:MTLResourceStorageModeShared];
         _cached_out    = [_device newBufferWithLength:output_bytes options:MTLResourceStorageModeShared];
-        static size_t _cached_size = total;
+        _cached_size = total;
     }
-    
+
     memcpy([_cached_down_w contents], down_w, weight_bytes);
     memcpy([_cached_x contents], x, input_bytes);
-    
+
     id<MTLCommandBuffer> cmd = [_queue commandBuffer];
     id<MTLComputeCommandEncoder> enc = [cmd computeCommandEncoder];
-    
-    [enc setComputePipelineState:_pipe_down];   // ← fixed
+
+    [enc setComputePipelineState:_pipe_down];
     [enc setBuffer:_cached_down_w offset:0 atIndex:0];
     [enc setBuffer:_cached_x      offset:0 atIndex:1];
     [enc setBuffer:_cached_out    offset:0 atIndex:2];
     [enc setBytes:&K length:sizeof(uint32_t) atIndex:3];
-    
+
     uint32_t gsize = 128;
-    size_t tg_bytes = (gsize / 32) * sizeof(float);   // ← only 1 value per simd
+    size_t tg_bytes = (gsize / 32) * sizeof(float);
     [enc setThreadgroupMemoryLength:tg_bytes atIndex:0];
-    
+
     MTLSize grid  = MTLSizeMake(M, BATCH, 1);
     MTLSize group = MTLSizeMake(gsize, 1, 1);
     [enc dispatchThreadgroups:grid threadsPerThreadgroup:group];
-    
+
     [enc endEncoding];
     [cmd commit];
     [cmd waitUntilCompleted];
 
-    static const void* _last_down_w = nullptr;
-    if (_last_down_w != down_w) {
-        memcpy([_cached_down_w contents], down_w, weight_bytes);
-        _last_down_w = down_w;
-    }
-    memcpy([_cached_x contents], x, input_bytes);
-    
+    memcpy(out, [_cached_out contents], output_bytes);
     return 0;
 }
 
