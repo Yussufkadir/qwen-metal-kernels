@@ -1,6 +1,3 @@
-"""
-qwen_custom.py — Custom Qwen forward: MLX attention + our Metal MLP
-"""
 import time, gc
 import numpy as np, ctypes, mlx.core as mx
 from mlx_lm import load
@@ -15,7 +12,6 @@ B = len(model.layers)
 MG, KG = 4864, 896
 MD, KD = 896, 4864
 
-# Extract weights
 gate = np.zeros((B, MG, KG), dtype=np.float16)
 up   = np.zeros((B, MG, KG), dtype=np.float16)
 down = np.zeros((B, MD, KD), dtype=np.float16)
@@ -24,7 +20,6 @@ for i, l in enumerate(model.layers):
     up[i]   = np.array(l.mlp.up_proj.weight.astype(mx.float32)).astype(np.float16)
     down[i] = np.array(l.mlp.down_proj.weight.astype(mx.float32)).astype(np.float16)
 
-# Metal buffer setup
 g_bits = np.ascontiguousarray(gate).view(np.uint16)
 u_bits = np.ascontiguousarray(up).view(np.uint16)
 d_bits = np.ascontiguousarray(down).view(np.uint16)
@@ -53,9 +48,6 @@ _lib.run_down_batched(pd, ph, pdy, Bc, Mdc, Kdc)
 print("Metal ready.\n")
 
 def metal_mlp_single_layer(layer_idx, hidden_np):
-    """
-    hidden_np: [1, seq, 896] -> returns this layer's MLP output [1, seq, 896]
-    """
     seq = hidden_np.shape[1]
     res = np.zeros((1, seq, MD), dtype=np.float32)
     for pos in range(seq):
@@ -63,43 +55,36 @@ def metal_mlp_single_layer(layer_idx, hidden_np):
         _lib.run_gate_up_batched(pg, pu, px, pgy, puy, Bc, Mgc, Kgc)
         np.multiply(g_out / (1.0 + np.exp(-g_out)), u_out, out=h_batch)
         _lib.run_down_batched(pd, ph, pdy, Bc, Mdc, Kdc)
-        res[0, pos, :] = d_out[layer_idx]  # pick this layer's output
+        res[0, pos, :] = d_out[layer_idx]  
     return res
 
 def custom_generate(prompt, max_new=20):
     tokens = mx.array([tokenizer.encode(prompt)])
     generated = []
     for step in range(max_new):
-        # Embed
-        h = model.model.embed_tokens(tokens)  # [1, seq, 896]
+        h = model.model.embed_tokens(tokens)  
         mx.eval(h)
         seq_len = h.shape[1]
-        
-        # Run transformer layers
+
         for i, layer in enumerate(model.model.layers):
-            # Attention
             residual = h
             h_norm = layer.input_layernorm(h)
             attn = layer.self_attn(h_norm)
             h = residual + attn
             mx.eval(h)
-            
-            # MLP (our Metal kernel)
+
             residual = h
             h_norm = layer.post_attention_layernorm(h)
-            # Convert to numpy
             h_np = np.array(h_norm.astype(mx.float32)).astype(np.float32)
-            mlp_np = metal_mlp_single_layer(i, h_np)  # [1, seq, 896]
-            # Convert back to MLX
+            mlp_np = metal_mlp_single_layer(i, h_np) 
             mlp_out = mx.array(mlp_np.reshape(1, seq_len, MD))
             h = residual + mlp_out
             mx.eval(h)
             del h_np, mlp_np, mlp_out, residual, h_norm, attn
             gc.collect()
-        
-        # Final norm + lm_head
+
         h = model.model.norm(h)
-        logits = model.lm_head(h[:, -1:, :])  # only last token
+        logits = model.lm_head(h[:, -1:, :])  
         mx.eval(logits)
         next_id = mx.argmax(logits[0, -1], axis=-1).item()
         del logits, h
@@ -112,7 +97,6 @@ def custom_generate(prompt, max_new=20):
             break
     return tokenizer.decode(generated)
 
-# Test questions
 prompts = [
     "What is the capital of France?",
     "What color is the sky?",

@@ -26,7 +26,6 @@ extern "C" {
         uint32_t B, uint32_t M, uint32_t K);
 }
 
-// ── Helpers ─────────────────────────────────────────
 
 id<MTLBuffer> loadHalfBuffer(id<MTLDevice> device, const std::string& path) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
@@ -91,7 +90,6 @@ void apply_rope(std::vector<float>& vec, int pos, int head_dim, float theta = 10
     }
 }
 
-// CPU attention (one head)
 std::vector<float> attention_head(const std::vector<float>& q,
                                   const std::vector<float>& k_all,
                                   const std::vector<float>& v_all,
@@ -116,7 +114,6 @@ std::vector<float> attention_head(const std::vector<float>& q,
     return out;
 }
 
-// ── Main ────────────────────────────────────────────
 
 int main(int argc, char* argv[]) {
     id<MTLDevice> device = MTLCreateSystemDefaultDevice();
@@ -159,7 +156,6 @@ int main(int argc, char* argv[]) {
         layers.push_back(w);
     }
 
-    // Concatenate MLP weights
     id<MTLBuffer> bigGate = [device newBufferWithLength:NUM_LAYERS * INTERMEDIATE * HIDDEN_DIM * sizeof(uint16_t)
                                                 options:MTLResourceStorageModeShared];
     id<MTLBuffer> bigUp   = [device newBufferWithLength:NUM_LAYERS * INTERMEDIATE * HIDDEN_DIM * sizeof(uint16_t)
@@ -175,7 +171,6 @@ int main(int argc, char* argv[]) {
                [layers[i].down contents], layers[i].down.length);
     }
 
-    // Pre-load MLP buffers
     float dummy_gate_out[NUM_LAYERS * INTERMEDIATE];
     float dummy_up_out[NUM_LAYERS * INTERMEDIATE];
     float dummy_x[NUM_LAYERS * HIDDEN_DIM] = {0};
@@ -186,7 +181,6 @@ int main(int argc, char* argv[]) {
     run_down_batched((const uint16_t*)[bigDown contents], dummy_mlp, dummy_down_out,
                      NUM_LAYERS, HIDDEN_DIM, INTERMEDIATE);
 
-    // KV caches
     std::vector<std::vector<uint16_t>> k_cache(NUM_LAYERS), v_cache(NUM_LAYERS);
 
     std::vector<int> input_ids;
@@ -204,7 +198,6 @@ int main(int argc, char* argv[]) {
         @autoreleasepool {
             int token_id = (step < input_ids.size()) ? input_ids[step] : generated_ids.back();
 
-            // Embedding
             id<MTLBuffer> hidden = [device newBufferWithLength:HIDDEN_DIM * sizeof(uint16_t)
                                                        options:MTLResourceStorageModeShared];
             {
@@ -215,9 +208,7 @@ int main(int argc, char* argv[]) {
 
             int current_pos = seq_len++;
 
-            // Layer loop
             for (int l = 0; l < NUM_LAYERS; l++) {
-                // Pre‑attention RMSNorm
                 id<MTLBuffer> normed = [device newBufferWithLength:HIDDEN_DIM * sizeof(uint16_t)
                                                            options:MTLResourceStorageModeShared];
                 uint d = HIDDEN_DIM;
@@ -226,7 +217,6 @@ int main(int argc, char* argv[]) {
                 runKernel(device, queue, pipeRmsNorm,
                          @[hidden, layers[l].input_norm, normed, d_buf], HIDDEN_DIM);
 
-                // Q, K, V projections
                 id<MTLBuffer> q_buf = matvec(device, queue, pipeMatvec, layers[l].q_proj, normed,
                                              NUM_HEADS*HEAD_DIM, HIDDEN_DIM);
                 id<MTLBuffer> k_buf = matvec(device, queue, pipeMatvec, layers[l].k_proj, normed,
@@ -247,7 +237,6 @@ int main(int argc, char* argv[]) {
                 std::vector<float> k_float = toFloatVec(k_buf, NUM_KV_HEADS*HEAD_DIM);
                 std::vector<float> v_float = toFloatVec(v_buf, NUM_KV_HEADS*HEAD_DIM);
 
-                // RoPE on Q and K
                 for (int h = 0; h < NUM_HEADS; h++) {
                     std::vector<float> q_head(q_float.begin() + h*HEAD_DIM,
                                              q_float.begin() + (h+1)*HEAD_DIM);
@@ -261,7 +250,6 @@ int main(int argc, char* argv[]) {
                     std::copy(k_head.begin(), k_head.end(), k_float.begin() + h*HEAD_DIM);
                 }
 
-                // Append to KV cache
                 auto toHalfVec = [](const std::vector<float>& fvec) {
                     std::vector<uint16_t> hvec(fvec.size());
                     for (size_t i = 0; i < fvec.size(); i++) {
@@ -273,7 +261,6 @@ int main(int argc, char* argv[]) {
                 k_cache[l].insert(k_cache[l].end(), toHalfVec(k_float).begin(), toHalfVec(k_float).end());
                 v_cache[l].insert(v_cache[l].end(), toHalfVec(v_float).begin(), toHalfVec(v_float).end());
 
-                // ── CPU Attention (GQA) ────────────────────
                 std::vector<float> attn_out_float(NUM_HEADS*HEAD_DIM, 0.0f);
                 for (int h = 0; h < NUM_HEADS; h++) {
                     int kv_head = h * NUM_KV_HEADS / NUM_HEADS;
@@ -304,19 +291,15 @@ int main(int argc, char* argv[]) {
                         memcpy(&ptr[i], &h, sizeof(h));
                     }
                 }
-
-                // Output projection
                 id<MTLBuffer> attn_proj = matvec(device, queue, pipeMatvec, layers[l].o_proj, attn_out,
                                                  HIDDEN_DIM, NUM_HEADS*HEAD_DIM);
                 runKernel(device, queue, pipeResAdd, @[hidden, attn_proj], HIDDEN_DIM);
 
-                // Post‑attention RMSNorm
                 normed = [device newBufferWithLength:HIDDEN_DIM*sizeof(uint16_t)
                                              options:MTLResourceStorageModeShared];
                 runKernel(device, queue, pipeRmsNorm,
                          @[hidden, layers[l].post_norm, normed, d_buf], HIDDEN_DIM);
 
-                // ── Batched MLP ────────────────────────
                 float* x_batch = new float[NUM_LAYERS * HIDDEN_DIM];
                 uint16_t* normPtr = (uint16_t*)[normed contents];
                 for (int i = 0; i < NUM_LAYERS; i++)
@@ -354,7 +337,6 @@ int main(int argc, char* argv[]) {
                 delete[] mlp_hidden; delete[] down_out;
             }
 
-            // Final RMSNorm
             id<MTLBuffer> final_hidden = [device newBufferWithLength:HIDDEN_DIM*sizeof(uint16_t)
                                                              options:MTLResourceStorageModeShared];
             uint d = HIDDEN_DIM;
@@ -363,7 +345,6 @@ int main(int argc, char* argv[]) {
             runKernel(device, queue, pipeRmsNorm,
                      @[hidden, final_norm, final_hidden, d_buf], HIDDEN_DIM);
 
-            // LM head
             id<MTLBuffer> logits_buf = matvec(device, queue, pipeMatvec, lm_head, final_hidden,
                                               VOCAB_SIZE, HIDDEN_DIM);
             uint16_t* logits = (uint16_t*)[logits_buf contents];
