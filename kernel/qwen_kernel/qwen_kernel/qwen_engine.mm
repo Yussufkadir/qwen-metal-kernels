@@ -957,153 +957,498 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
     if (!library) { LOG(eng, "[qwen_engine] default.metallib not found"); delete eng; return nullptr; }
 
     static const char* optimizedMetalSource = R"METAL(
-        #include <metal_stdlib>
-        using namespace metal;
-        kernel void matvec_q4(device const uchar* w [[buffer(0)]], device const half* s [[buffer(1)]],
-                              device const half* x [[buffer(2)]], device half* y [[buffer(3)]],
-                              constant uint& K [[buffer(4)]], threadgroup float* p [[threadgroup(0)]],
-                              uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
-                              uint nt [[threads_per_threadgroup]]) {
-            uint nb=K/2, ng=K/64; float sum=0;
-            for(uint b=tid;b<nb;b+=nt){uchar v=w[row*nb+b];float z=float(s[row*ng+b/32]);
-                sum+=z*(float(int(v&15)-8)*float(x[2*b])+float(int(v>>4)-8)*float(x[2*b+1]));}
-            sum=simd_sum(sum);if((tid&31u)==0)p[tid/32]=sum;threadgroup_barrier(mem_flags::mem_threadgroup);
-            if(tid==0){float t=0;for(uint i=0;i<nt/32;i++)t+=p[i];y[row]=half(t);}
+#include <metal_stdlib>
+using namespace metal;
+
+kernel void matvec_q4(device const uchar* weights [[buffer(0)]],
+                      device const half* scales [[buffer(1)]],
+                      device const half* x [[buffer(2)]],
+                      device half* y [[buffer(3)]],
+                      constant uint& K [[buffer(4)]],
+                      threadgroup float* partial [[threadgroup(0)]],
+                      uint row [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]],
+                      uint threads [[threads_per_threadgroup]]) {
+    const uint packed_cols = K / 2;
+    const uint scale_groups = K / 64;
+    float sum = 0.0f;
+
+    for (uint packed_col = tid; packed_col < packed_cols; packed_col += threads) {
+        uchar packed = weights[row * packed_cols + packed_col];
+        float scale = float(scales[row * scale_groups + packed_col / 32]);
+
+        float w0 = float(int(packed & 15) - 8);
+        float w1 = float(int(packed >> 4) - 8);
+        float x0 = float(x[2 * packed_col]);
+        float x1 = float(x[2 * packed_col + 1]);
+
+        sum += scale * (w0 * x0 + w1 * x1);
+    }
+
+    sum = simd_sum(sum);
+    if ((tid & 31u) == 0) {
+        partial[tid / 32] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < threads / 32; i++) {
+            total += partial[i];
         }
-        kernel void gate_up_q4(device const uchar* gw [[buffer(0)]],device const half* gs [[buffer(1)]],
-                               device const uchar* uw [[buffer(2)]],device const half* us [[buffer(3)]],
-                               device const float* x [[buffer(4)]],device float* go [[buffer(5)]],
-                               device float* uo [[buffer(6)]],constant uint& K [[buffer(7)]],
-                               threadgroup float* p [[threadgroup(0)]],uint row [[threadgroup_position_in_grid]],
-                               uint tid [[thread_position_in_threadgroup]],uint nt [[threads_per_threadgroup]]) {
-            uint nb=K/2,ng=K/64;float a=0,bv=0;
-            for(uint j=tid;j<nb;j+=nt){uchar g=gw[row*nb+j],u=uw[row*nb+j];uint z=row*ng+j/32;
-                float x0=x[2*j],x1=x[2*j+1];a+=float(gs[z])*(float(int(g&15)-8)*x0+float(int(g>>4)-8)*x1);
-                bv+=float(us[z])*(float(int(u&15)-8)*x0+float(int(u>>4)-8)*x1);}
-            a=simd_sum(a);bv=simd_sum(bv);if((tid&31u)==0){p[(tid/32)*2]=a;p[(tid/32)*2+1]=bv;}
-            threadgroup_barrier(mem_flags::mem_threadgroup);if(tid==0){float ga=0,ua=0;for(uint i=0;i<nt/32;i++){ga+=p[i*2];ua+=p[i*2+1];}go[row]=ga;uo[row]=ua;}
+        y[row] = half(total);
+    }
+}
+
+kernel void gate_up_q4(device const uchar* gate_weights [[buffer(0)]],
+                       device const half* gate_scales [[buffer(1)]],
+                       device const uchar* up_weights [[buffer(2)]],
+                       device const half* up_scales [[buffer(3)]],
+                       device const float* x [[buffer(4)]],
+                       device float* gate_out [[buffer(5)]],
+                       device float* up_out [[buffer(6)]],
+                       constant uint& K [[buffer(7)]],
+                       threadgroup float* partial [[threadgroup(0)]],
+                       uint row [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]],
+                       uint threads [[threads_per_threadgroup]]) {
+    const uint packed_cols = K / 2;
+    const uint scale_groups = K / 64;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+
+    for (uint packed_col = tid; packed_col < packed_cols; packed_col += threads) {
+        uchar gate_packed = gate_weights[row * packed_cols + packed_col];
+        uchar up_packed = up_weights[row * packed_cols + packed_col];
+        uint scale_index = row * scale_groups + packed_col / 32;
+
+        float x0 = x[2 * packed_col];
+        float x1 = x[2 * packed_col + 1];
+
+        gate_sum += float(gate_scales[scale_index]) *
+                    (float(int(gate_packed & 15) - 8) * x0 +
+                     float(int(gate_packed >> 4) - 8) * x1);
+        up_sum += float(up_scales[scale_index]) *
+                  (float(int(up_packed & 15) - 8) * x0 +
+                   float(int(up_packed >> 4) - 8) * x1);
+    }
+
+    gate_sum = simd_sum(gate_sum);
+    up_sum = simd_sum(up_sum);
+
+    if ((tid & 31u) == 0) {
+        uint warp = tid / 32;
+        partial[warp * 2] = gate_sum;
+        partial[warp * 2 + 1] = up_sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float gate_total = 0.0f;
+        float up_total = 0.0f;
+        for (uint i = 0; i < threads / 32; i++) {
+            gate_total += partial[i * 2];
+            up_total += partial[i * 2 + 1];
         }
-        kernel void down_q4(device const uchar* w [[buffer(0)]],device const half* s [[buffer(1)]],
-                            device const float* x [[buffer(2)]],device float* y [[buffer(3)]],
-                            constant uint& K [[buffer(4)]],threadgroup float* p [[threadgroup(0)]],
-                            uint row [[threadgroup_position_in_grid]],uint tid [[thread_position_in_threadgroup]],
-                            uint nt [[threads_per_threadgroup]]) {
-            uint nb=K/2,ng=K/64;float sum=0;for(uint j=tid;j<nb;j+=nt){uchar v=w[row*nb+j];float z=float(s[row*ng+j/32]);
-                sum+=z*(float(int(v&15)-8)*x[2*j]+float(int(v>>4)-8)*x[2*j+1]);}
-            sum=simd_sum(sum);if((tid&31u)==0)p[tid/32]=sum;threadgroup_barrier(mem_flags::mem_threadgroup);
-            if(tid==0){float t=0;for(uint i=0;i<nt/32;i++)t+=p[i];y[row]=t;}
+        gate_out[row] = gate_total;
+        up_out[row] = up_total;
+    }
+}
+
+kernel void down_q4(device const uchar* weights [[buffer(0)]],
+                    device const half* scales [[buffer(1)]],
+                    device const float* x [[buffer(2)]],
+                    device float* y [[buffer(3)]],
+                    constant uint& K [[buffer(4)]],
+                    threadgroup float* partial [[threadgroup(0)]],
+                    uint row [[threadgroup_position_in_grid]],
+                    uint tid [[thread_position_in_threadgroup]],
+                    uint threads [[threads_per_threadgroup]]) {
+    const uint packed_cols = K / 2;
+    const uint scale_groups = K / 64;
+    float sum = 0.0f;
+
+    for (uint packed_col = tid; packed_col < packed_cols; packed_col += threads) {
+        uchar packed = weights[row * packed_cols + packed_col];
+        float scale = float(scales[row * scale_groups + packed_col / 32]);
+
+        sum += scale *
+               (float(int(packed & 15) - 8) * x[2 * packed_col] +
+                float(int(packed >> 4) - 8) * x[2 * packed_col + 1]);
+    }
+
+    sum = simd_sum(sum);
+    if ((tid & 31u) == 0) {
+        partial[tid / 32] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < threads / 32; i++) {
+            total += partial[i];
         }
-        kernel void matvec_q8(device const char* w [[buffer(0)]], device const half* s [[buffer(1)]],
-                              device const half* x [[buffer(2)]], device half* y [[buffer(3)]],
-                              constant uint& K [[buffer(4)]], threadgroup float* p [[threadgroup(0)]],
-                              uint row [[threadgroup_position_in_grid]], uint tid [[thread_position_in_threadgroup]],
-                              uint nt [[threads_per_threadgroup]]) {
-            uint ng=K/64; float sum=0;
-            for(uint j=tid;j<K;j+=nt){float z=float(s[row*ng+j/64]);
-                sum+=z*float(w[row*K+j])*float(x[j]);}
-            sum=simd_sum(sum);if((tid&31u)==0)p[tid/32]=sum;threadgroup_barrier(mem_flags::mem_threadgroup);
-            if(tid==0){float t=0;for(uint i=0;i<nt/32;i++)t+=p[i];y[row]=half(t);}
+        y[row] = total;
+    }
+}
+
+kernel void matvec_q8(device const char* weights [[buffer(0)]],
+                      device const half* scales [[buffer(1)]],
+                      device const half* x [[buffer(2)]],
+                      device half* y [[buffer(3)]],
+                      constant uint& K [[buffer(4)]],
+                      threadgroup float* partial [[threadgroup(0)]],
+                      uint row [[threadgroup_position_in_grid]],
+                      uint tid [[thread_position_in_threadgroup]],
+                      uint threads [[threads_per_threadgroup]]) {
+    const uint scale_groups = K / 64;
+    float sum = 0.0f;
+
+    for (uint col = tid; col < K; col += threads) {
+        float scale = float(scales[row * scale_groups + col / 64]);
+        sum += scale * float(weights[row * K + col]) * float(x[col]);
+    }
+
+    sum = simd_sum(sum);
+    if ((tid & 31u) == 0) {
+        partial[tid / 32] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < threads / 32; i++) {
+            total += partial[i];
         }
-        kernel void gate_up_q8(device const char* gw [[buffer(0)]],device const half* gs [[buffer(1)]],
-                               device const char* uw [[buffer(2)]],device const half* us [[buffer(3)]],
-                               device const float* x [[buffer(4)]],device float* go [[buffer(5)]],
-                               device float* uo [[buffer(6)]],constant uint& K [[buffer(7)]],
-                               threadgroup float* p [[threadgroup(0)]],uint row [[threadgroup_position_in_grid]],
-                               uint tid [[thread_position_in_threadgroup]],uint nt [[threads_per_threadgroup]]) {
-            uint ng=K/64;float a=0,bv=0;
-            for(uint j=tid;j<K;j+=nt){uint z=row*ng+j/64;float xj=x[j];
-                a+=float(gs[z])*float(gw[row*K+j])*xj;bv+=float(us[z])*float(uw[row*K+j])*xj;}
-            a=simd_sum(a);bv=simd_sum(bv);if((tid&31u)==0){p[(tid/32)*2]=a;p[(tid/32)*2+1]=bv;}
-            threadgroup_barrier(mem_flags::mem_threadgroup);if(tid==0){float ga=0,ua=0;for(uint i=0;i<nt/32;i++){ga+=p[i*2];ua+=p[i*2+1];}go[row]=ga;uo[row]=ua;}
+        y[row] = half(total);
+    }
+}
+
+kernel void gate_up_q8(device const char* gate_weights [[buffer(0)]],
+                       device const half* gate_scales [[buffer(1)]],
+                       device const char* up_weights [[buffer(2)]],
+                       device const half* up_scales [[buffer(3)]],
+                       device const float* x [[buffer(4)]],
+                       device float* gate_out [[buffer(5)]],
+                       device float* up_out [[buffer(6)]],
+                       constant uint& K [[buffer(7)]],
+                       threadgroup float* partial [[threadgroup(0)]],
+                       uint row [[threadgroup_position_in_grid]],
+                       uint tid [[thread_position_in_threadgroup]],
+                       uint threads [[threads_per_threadgroup]]) {
+    const uint scale_groups = K / 64;
+    float gate_sum = 0.0f;
+    float up_sum = 0.0f;
+
+    for (uint col = tid; col < K; col += threads) {
+        uint scale_index = row * scale_groups + col / 64;
+        float x_value = x[col];
+
+        gate_sum += float(gate_scales[scale_index]) *
+                    float(gate_weights[row * K + col]) * x_value;
+        up_sum += float(up_scales[scale_index]) *
+                  float(up_weights[row * K + col]) * x_value;
+    }
+
+    gate_sum = simd_sum(gate_sum);
+    up_sum = simd_sum(up_sum);
+
+    if ((tid & 31u) == 0) {
+        uint warp = tid / 32;
+        partial[warp * 2] = gate_sum;
+        partial[warp * 2 + 1] = up_sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float gate_total = 0.0f;
+        float up_total = 0.0f;
+        for (uint i = 0; i < threads / 32; i++) {
+            gate_total += partial[i * 2];
+            up_total += partial[i * 2 + 1];
         }
-        kernel void down_q8(device const char* w [[buffer(0)]],device const half* s [[buffer(1)]],
-                            device const float* x [[buffer(2)]],device float* y [[buffer(3)]],
-                            constant uint& K [[buffer(4)]],threadgroup float* p [[threadgroup(0)]],
-                            uint row [[threadgroup_position_in_grid]],uint tid [[thread_position_in_threadgroup]],
-                            uint nt [[threads_per_threadgroup]]) {
-            uint ng=K/64;float sum=0;for(uint j=tid;j<K;j+=nt){float z=float(s[row*ng+j/64]);
-                sum+=z*float(w[row*K+j])*x[j];}
-            sum=simd_sum(sum);if((tid&31u)==0)p[tid/32]=sum;threadgroup_barrier(mem_flags::mem_threadgroup);
-            if(tid==0){float t=0;for(uint i=0;i<nt/32;i++)t+=p[i];y[row]=t;}
+        gate_out[row] = gate_total;
+        up_out[row] = up_total;
+    }
+}
+
+kernel void down_q8(device const char* weights [[buffer(0)]],
+                    device const half* scales [[buffer(1)]],
+                    device const float* x [[buffer(2)]],
+                    device float* y [[buffer(3)]],
+                    constant uint& K [[buffer(4)]],
+                    threadgroup float* partial [[threadgroup(0)]],
+                    uint row [[threadgroup_position_in_grid]],
+                    uint tid [[thread_position_in_threadgroup]],
+                    uint threads [[threads_per_threadgroup]]) {
+    const uint scale_groups = K / 64;
+    float sum = 0.0f;
+
+    for (uint col = tid; col < K; col += threads) {
+        float scale = float(scales[row * scale_groups + col / 64]);
+        sum += scale * float(weights[row * K + col]) * x[col];
+    }
+
+    sum = simd_sum(sum);
+    if ((tid & 31u) == 0) {
+        partial[tid / 32] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < threads / 32; i++) {
+            total += partial[i];
         }
-        kernel void rope_qk_inplace(device const half* q [[buffer(0)]],device half* k [[buffer(1)]],
-                                    device float* qr [[buffer(2)]],constant uint& pos [[buffer(3)]],
-                                    uint id [[thread_position_in_grid]]) {
-            constexpr uint hd=32,qh=14,kh=2;if(id>=(qh+kh)*hd)return;bool iq=id<qh*hd;
-            uint z=iq?id:id-qh*hd,h=z/hd,i=z%hd,b=h*64;
-            float angle=float(pos)*pow(1000000.0f,-float(2*i)/64.0f),c=cos(angle),s=sin(angle);
-            float x=iq?float(q[b+i]):float(k[b+i]),y=iq?float(q[b+i+hd]):float(k[b+i+hd]);
-            if(iq){qr[b+i]=x*c-y*s;qr[b+i+hd]=y*c+x*s;}else{k[b+i]=half(x*c-y*s);k[b+i+hd]=half(y*c+x*s);}
+        y[row] = total;
+    }
+}
+
+kernel void rope_qk_inplace(device const half* q [[buffer(0)]],
+                            device half* k [[buffer(1)]],
+                            device float* q_rotated [[buffer(2)]],
+                            constant uint& pos [[buffer(3)]],
+                            uint id [[thread_position_in_grid]]) {
+    constexpr uint half_head_dim = 32;
+    constexpr uint num_q_heads = 14;
+    constexpr uint num_kv_heads = 2;
+
+    if (id >= (num_q_heads + num_kv_heads) * half_head_dim) {
+        return;
+    }
+
+    bool is_q = id < num_q_heads * half_head_dim;
+    uint local_id = is_q ? id : id - num_q_heads * half_head_dim;
+    uint head = local_id / half_head_dim;
+    uint dim = local_id % half_head_dim;
+    uint base = head * 64;
+
+    float angle = float(pos) * pow(1000000.0f, -float(2 * dim) / 64.0f);
+    float c = cos(angle);
+    float s = sin(angle);
+
+    float x0 = is_q ? float(q[base + dim]) : float(k[base + dim]);
+    float x1 = is_q ? float(q[base + dim + half_head_dim])
+                    : float(k[base + dim + half_head_dim]);
+
+    float y0 = x0 * c - x1 * s;
+    float y1 = x1 * c + x0 * s;
+
+    if (is_q) {
+        q_rotated[base + dim] = y0;
+        q_rotated[base + dim + half_head_dim] = y1;
+    } else {
+        k[base + dim] = half(y0);
+        k[base + dim + half_head_dim] = half(y1);
+    }
+}
+
+kernel void kv_cache_append(device const half* k [[buffer(0)]],
+                            device const half* v [[buffer(1)]],
+                            device half* k_cache [[buffer(2)]],
+                            device half* v_cache [[buffer(3)]],
+                            constant uint& pos [[buffer(4)]],
+                            uint id [[thread_position_in_grid]]) {
+    constexpr uint kv_dim = 128;
+
+    if (id < kv_dim) {
+        uint offset = pos * kv_dim + id;
+        k_cache[offset] = k[id];
+        v_cache[offset] = v[id];
+    }
+}
+
+kernel void gqa_attention_scores(device const float* q [[buffer(0)]],
+                                 device const half* k_cache [[buffer(1)]],
+                                 device float* scores [[buffer(2)]],
+                                 constant uint& n [[buffer(3)]],
+                                 uint3 group [[threadgroup_position_in_grid]],
+                                 uint3 local [[thread_position_in_threadgroup]]) {
+    constexpr uint num_heads = 14;
+    constexpr uint num_kv_heads = 2;
+    constexpr uint head_dim = 64;
+    constexpr uint kv_dim = num_kv_heads * head_dim;
+    constexpr float inv_sqrt_head_dim = 0.125f;
+
+    uint token = group.x;
+    uint head = group.y;
+    uint lane = local.x;
+
+    if (token >= n || head >= num_heads) {
+        return;
+    }
+
+    uint kv_head = head / (num_heads / num_kv_heads);
+    float sum = 0.0f;
+
+    for (uint dim = lane; dim < head_dim; dim += 32) {
+        sum += q[head * head_dim + dim] *
+               float(k_cache[token * kv_dim + kv_head * head_dim + dim]);
+    }
+
+    sum = simd_sum(sum);
+    if (lane == 0) {
+        scores[head * n + token] = sum * inv_sqrt_head_dim;
+    }
+}
+
+kernel void gqa_softmax(device float* scores [[buffer(0)]],
+                        constant uint& n [[buffer(1)]],
+                        threadgroup float* partial [[threadgroup(0)]],
+                        uint head [[threadgroup_position_in_grid]],
+                        uint tid [[thread_position_in_threadgroup]],
+                        uint threads [[threads_per_threadgroup]]) {
+    constexpr uint num_heads = 14;
+
+    if (head >= num_heads || n == 0) {
+        return;
+    }
+
+    uint base = head * n;
+
+    float local_max = -INFINITY;
+    for (uint token = tid; token < n; token += threads) {
+        local_max = max(local_max, scores[base + token]);
+    }
+
+    local_max = simd_max(local_max);
+    if ((tid & 31u) == 0) {
+        partial[tid / 32] = local_max;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float group_max = partial[0];
+        for (uint i = 1; i < threads / 32; i++) {
+            group_max = max(group_max, partial[i]);
         }
-        kernel void kv_cache_append(device const half* k [[buffer(0)]],device const half* v [[buffer(1)]],
-                                    device half* kc [[buffer(2)]],device half* vc [[buffer(3)]],
-                                    constant uint& pos [[buffer(4)]],uint id [[thread_position_in_grid]]) {
-            if(id<128){uint o=pos*128+id;kc[o]=k[id];vc[o]=v[id];}
+        partial[0] = group_max;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float max_score = partial[0];
+
+    float local_sum = 0.0f;
+    for (uint token = tid; token < n; token += threads) {
+        float value = exp(scores[base + token] - max_score);
+        scores[base + token] = value;
+        local_sum += value;
+    }
+
+    local_sum = simd_sum(local_sum);
+    if ((tid & 31u) == 0) {
+        partial[tid / 32] = local_sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float group_sum = 0.0f;
+        for (uint i = 0; i < threads / 32; i++) {
+            group_sum += partial[i];
         }
-        kernel void gqa_attention_scores(device const float* q [[buffer(0)]],device const half* kc [[buffer(1)]],
-                                         device float* scores [[buffer(2)]],constant uint& n [[buffer(3)]],
-                                         uint3 g [[threadgroup_position_in_grid]],
-                                         uint3 local [[thread_position_in_threadgroup]]) {
-            uint t=g.x,h=g.y,lane=local.x;if(t>=n||h>=14)return;uint kh=h/7;float sum=0;
-            for(uint d=lane;d<64;d+=32)sum+=q[h*64+d]*float(kc[t*128+kh*64+d]);
-            sum=simd_sum(sum);if(lane==0)scores[h*n+t]=sum*0.125f;
+        partial[0] = 1.0f / group_sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv_sum = partial[0];
+
+    for (uint token = tid; token < n; token += threads) {
+        scores[base + token] *= inv_sum;
+    }
+}
+
+kernel void gqa_weighted_sum(device const float* scores [[buffer(0)]],
+                             device const half* v_cache [[buffer(1)]],
+                             device half* out [[buffer(2)]],
+                             constant uint& n [[buffer(3)]],
+                             uint2 gid [[thread_position_in_grid]]) {
+    constexpr uint num_heads = 14;
+    constexpr uint num_kv_heads = 2;
+    constexpr uint head_dim = 64;
+    constexpr uint kv_dim = num_kv_heads * head_dim;
+
+    uint dim = gid.x;
+    uint head = gid.y;
+
+    if (dim >= head_dim || head >= num_heads) {
+        return;
+    }
+
+    uint kv_head = head / (num_heads / num_kv_heads);
+    float sum = 0.0f;
+
+    for (uint token = 0; token < n; token++) {
+        sum += scores[head * n + token] *
+               float(v_cache[token * kv_dim + kv_head * head_dim + dim]);
+    }
+
+    out[head * head_dim + dim] = half(sum);
+}
+
+kernel void rms_norm_fast(device const half* x [[buffer(0)]],
+                          device const half* weight [[buffer(1)]],
+                          device half* y [[buffer(2)]],
+                          constant uint& D [[buffer(3)]],
+                          threadgroup float* partial [[threadgroup(0)]],
+                          uint tid [[thread_position_in_threadgroup]],
+                          uint threads [[threads_per_threadgroup]]) {
+    float sum = 0.0f;
+
+    for (uint i = tid; i < D; i += threads) {
+        float value = float(x[i]);
+        sum += value * value;
+    }
+
+    sum = simd_sum(sum);
+    if ((tid & 31u) == 0) {
+        partial[tid / 32] = sum;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    if (tid == 0) {
+        float total = 0.0f;
+        for (uint i = 0; i < (threads + 31) / 32; i++) {
+            total += partial[i];
         }
-        kernel void gqa_softmax(device float* scores [[buffer(0)]],constant uint& n [[buffer(1)]],
-                                threadgroup float* p [[threadgroup(0)]],uint h [[threadgroup_position_in_grid]],
-                                uint tid [[thread_position_in_threadgroup]],uint nt [[threads_per_threadgroup]]) {
-            if(h>=14||n==0)return;uint b=h*n;float m=-INFINITY;for(uint t=tid;t<n;t+=nt)m=max(m,scores[b+t]);
-            m=simd_max(m);if((tid&31u)==0)p[tid/32]=m;threadgroup_barrier(mem_flags::mem_threadgroup);
-            if(tid==0){float z=p[0];for(uint i=1;i<nt/32;i++)z=max(z,p[i]);p[0]=z;}threadgroup_barrier(mem_flags::mem_threadgroup);m=p[0];
-            float s=0;for(uint t=tid;t<n;t+=nt){float v=exp(scores[b+t]-m);scores[b+t]=v;s+=v;}
-            s=simd_sum(s);if((tid&31u)==0)p[tid/32]=s;threadgroup_barrier(mem_flags::mem_threadgroup);
-            if(tid==0){float z=0;for(uint i=0;i<nt/32;i++)z+=p[i];p[0]=1.0f/z;}threadgroup_barrier(mem_flags::mem_threadgroup);
-            float inv=p[0];for(uint t=tid;t<n;t+=nt)scores[b+t]*=inv;
-        }
-        kernel void gqa_weighted_sum(device const float* scores [[buffer(0)]],device const half* vc [[buffer(1)]],
-                                     device half* out [[buffer(2)]],constant uint& n [[buffer(3)]],
-                                     uint2 gid [[thread_position_in_grid]]) {
-            uint d=gid.x,h=gid.y;if(d>=64||h>=14)return;uint kh=h/7;float sum=0;
-            for(uint t=0;t<n;t++)sum+=scores[h*n+t]*float(vc[t*128+kh*64+d]);out[h*64+d]=half(sum);
-        }
-        kernel void rms_norm_fast(device const half* x [[buffer(0)]],
-                                  device const half* weight [[buffer(1)]],
-                                  device half* y [[buffer(2)]],
-                                  constant uint& D [[buffer(3)]],
-                                  threadgroup float* partial [[threadgroup(0)]],
-                                  uint tid [[thread_position_in_threadgroup]],
-                                  uint threads [[threads_per_threadgroup]]) {
-            float sum = 0.0f;
-            for (uint i = tid; i < D; i += threads) { float v = float(x[i]); sum += v * v; }
-            sum = simd_sum(sum);
-            if ((tid & 31u) == 0) partial[tid / 32] = sum;
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            if (tid == 0) {
-                float total = 0.0f;
-                for (uint i = 0; i < (threads + 31) / 32; i++) total += partial[i];
-                partial[0] = rsqrt(total / float(D) + 1e-6f);
-            }
-            threadgroup_barrier(mem_flags::mem_threadgroup);
-            float inv_rms = partial[0];
-            for (uint i = tid; i < D; i += threads)
-                y[i] = half(float(x[i]) * float(weight[i]) * inv_rms);
-        }
-        kernel void silu_mul_float(device const float* gate [[buffer(0)]],
-                                   device const float* up [[buffer(1)]],
-                                   device float* out [[buffer(2)]],
-                                   uint id [[thread_position_in_grid]]) {
-            float g = gate[id];
-            out[id] = (g / (1.0f + exp(-g))) * up[id];
-        }
-        kernel void half_to_float(device const half* input [[buffer(0)]],
-                                  device float* output [[buffer(1)]],
-                                  uint id [[thread_position_in_grid]]) {
-            output[id] = float(input[id]);
-        }
-        kernel void residual_add_float(device half* x [[buffer(0)]],
-                                       device const float* r [[buffer(1)]],
-                                       uint id [[thread_position_in_grid]]) {
-            x[id] = half(float(x[id]) + float(half(r[id])));
-        }
+        partial[0] = rsqrt(total / float(D) + 1e-6f);
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    float inv_rms = partial[0];
+    for (uint i = tid; i < D; i += threads) {
+        y[i] = half(float(x[i]) * float(weight[i]) * inv_rms);
+    }
+}
+
+kernel void silu_mul_float(device const float* gate [[buffer(0)]],
+                           device const float* up [[buffer(1)]],
+                           device float* out [[buffer(2)]],
+                           uint id [[thread_position_in_grid]]) {
+    float gate_value = gate[id];
+    out[id] = (gate_value / (1.0f + exp(-gate_value))) * up[id];
+}
+
+kernel void half_to_float(device const half* input [[buffer(0)]],
+                          device float* output [[buffer(1)]],
+                          uint id [[thread_position_in_grid]]) {
+    output[id] = float(input[id]);
+}
+
+kernel void residual_add_float(device half* x [[buffer(0)]],
+                               device const float* residual [[buffer(1)]],
+                               uint id [[thread_position_in_grid]]) {
+    x[id] = half(float(x[id]) + float(half(residual[id])));
+}
     )METAL";
     NSError* compileError = nil;
     id<MTLLibrary> optimizedLibrary = [eng->device
