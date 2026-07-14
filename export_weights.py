@@ -15,7 +15,6 @@ save_tensor("norm.weight", model.model.norm.weight)
 head_weight = model.lm_head.weight if hasattr(model, 'lm_head') else model.model.embed_tokens.weight
 save_tensor("lm_head.weight", head_weight)
 
-
 for i, layer in enumerate(model.layers):
     save_tensor(f"layer{i}.input_layernorm.weight", layer.input_layernorm.weight)
     save_tensor(f"layer{i}.post_attention_layernorm.weight", layer.post_attention_layernorm.weight)
@@ -23,8 +22,17 @@ for i, layer in enumerate(model.layers):
     save_tensor(f"layer{i}.self_attn.k_proj.weight", layer.self_attn.k_proj.weight)
     save_tensor(f"layer{i}.self_attn.v_proj.weight", layer.self_attn.v_proj.weight)
     save_tensor(f"layer{i}.self_attn.o_proj.weight", layer.self_attn.o_proj.weight)
+
+    if getattr(layer.self_attn.q_proj, "bias", None) is not None:
+        save_tensor(f"layer{i}.self_attn.q_proj.bias", layer.self_attn.q_proj.bias)
+    if getattr(layer.self_attn.k_proj, "bias", None) is not None:
+        save_tensor(f"layer{i}.self_attn.k_proj.bias", layer.self_attn.k_proj.bias)
+    if getattr(layer.self_attn.v_proj, "bias", None) is not None:
+        save_tensor(f"layer{i}.self_attn.v_proj.bias", layer.self_attn.v_proj.bias)
+
     save_tensor(f"layer{i}.mlp.gate_proj.weight", layer.mlp.gate_proj.weight)
     save_tensor(f"layer{i}.mlp.up_proj.weight", layer.mlp.up_proj.weight)
     save_tensor(f"layer{i}.mlp.down_proj.weight", layer.mlp.down_proj.weight)
+    print(f"Layer {i} exported")
 
 print("Weights exported to qwen_weights/")

@@ -1,5 +1,3 @@
-cat > .gitignore << 'EOF'
-
 venv/
 __pycache__/
 *.pyc
@@ -10,6 +8,8 @@ xcshareddata/
 *.xcworkspace/
 DerivedData/
 build/
+*.dSYM/
+*.trace/
 
 *.air
 
@@ -17,7 +17,23 @@ libmetal_kernels.dylib
 
 qwen_weights/
 *.bin
+*.safetensors
+*.gguf
 
 .DS_Store
 Thumbs.db
-EOF
+
+# Local build/profiling artifacts
+inference_engine
+inference_engine.test
+mps_bench
+benchmark
+cpu_trace.trace/
+metal_trace.trace/
+
+# Local benchmark result dumps
+benchmark_*.json
+
+INFERENCE_BACKENDS.md
+
+default.metallib
