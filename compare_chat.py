@@ -20,7 +20,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("prompt", nargs="*", help="user prompt text")
     parser.add_argument("--system", default="You are a helpful assistant.")
     parser.add_argument("--tokens", "-n", type=int, default=80)
-    parser.add_argument("--backend", default="fp16", choices=["fp16", "int4", "int8", "mixed", "mps", "hybrid"])
+    parser.add_argument("--backend", default="fp16", choices=["fp16", "int4", "int8", "int8-fp16", "mixed", "mps", "hybrid"])
     parser.add_argument("--model", default=MODEL_NAME)
     parser.add_argument("--engine", type=Path, default=ENGINE)
     parser.add_argument("--engine-dir", type=Path, default=ENGINE_DIR)

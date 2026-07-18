@@ -17,6 +17,7 @@ typedef enum QwenBackend {
     QWEN_BACKEND_HYBRID = 3,
     QWEN_BACKEND_INT4_FP16_LM_HEAD = 4,
     QWEN_BACKEND_METAL_INT8 = 5,
+    QWEN_BACKEND_INT8_FP16_LM_HEAD = 6,
 } QwenBackend;
 
 typedef struct QwenSamplingParams {

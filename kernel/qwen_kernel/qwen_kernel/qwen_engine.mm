@@ -11,6 +11,12 @@
 #include <chrono>
 #include <random>
 #include <unordered_set>
+#include <unordered_map>
+#include <cstdlib>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
 
 #include "qwen_engine.h"
 
@@ -24,17 +30,24 @@ constexpr int NUM_KV_HEADS = 2;
 constexpr int HEAD_DIM = 64;
 constexpr int VOCAB_SIZE = 151936;
 constexpr int MAX_SEQ_LEN = 4096;
+constexpr int ATTENTION_BLOCK_SIZE = 256;
+constexpr int MAX_ATTENTION_BLOCKS = (MAX_SEQ_LEN + ATTENTION_BLOCK_SIZE - 1) / ATTENTION_BLOCK_SIZE;
+constexpr int GROUPED_GQA_MIN_BLOCKS = 14;
+constexpr int TILED_PREFILL_MIN_TOKENS = 512;
 constexpr float QWEN_ROPE_THETA = 1000000.0f;
 
 struct LayerWeights {
     id<MTLBuffer> input_norm, post_norm;
     id<MTLBuffer> q_proj, k_proj, v_proj, o_proj;
+    id<MTLBuffer> qkv_combined;
     id<MTLBuffer> q_scale, k_scale, v_scale, o_scale;
     id<MTLBuffer> q_bias, k_bias, v_bias;
     id<MTLBuffer> gate, up, down;
+    id<MTLBuffer> gate_up_combined;
     id<MTLBuffer> gate_scale, up_scale, down_scale;
     MPSMatrix *q_matrix=nil, *k_matrix=nil, *v_matrix=nil, *o_matrix=nil;
     MPSMatrix *gate_matrix=nil, *up_matrix=nil, *down_matrix=nil;
+    MPSMatrix *qkv_matrix=nil, *gate_up_matrix=nil;
 };
 
 struct SamplerState {
@@ -43,17 +56,167 @@ struct SamplerState {
     std::unordered_set<int> seen;
 };
 
-id<MTLBuffer> loadHalfBuffer(id<MTLDevice> device, const std::string& path, bool* ok) {
+struct PackedWeightEntry {
+    uint64_t offset = 0;
+    uint64_t size = 0;
+};
+
+struct PackedWeightStore {
+    bool ready = false;
+    bool mapped = false;
+    void* data = nullptr;
+    size_t size = 0;
+    int fd = -1;
+    std::unordered_map<std::string, PackedWeightEntry> entries;
+};
+
+PackedWeightStore openPackedWeights(const std::string& dir) {
+    PackedWeightStore store;
+    std::ifstream index(dir + "/weights.index");
+    if (!index) return store;
+
+    std::string name;
+    uint64_t offset = 0;
+    uint64_t size = 0;
+    while (index >> name >> offset >> size) {
+        store.entries[name] = PackedWeightEntry{offset, size};
+    }
+    if (store.entries.empty()) return store;
+
+    std::string packPath = dir + "/weights.pack";
+    store.fd = open(packPath.c_str(), O_RDONLY);
+    if (store.fd < 0) return store;
+
+    struct stat st;
+    if (fstat(store.fd, &st) != 0 || st.st_size <= 0) {
+        close(store.fd);
+        store.fd = -1;
+        return store;
+    }
+
+    store.size = (size_t)st.st_size;
+    store.data = mmap(nullptr, store.size, PROT_READ, MAP_PRIVATE, store.fd, 0);
+    if (store.data == MAP_FAILED) {
+        close(store.fd);
+        store.fd = -1;
+        store.data = nullptr;
+        store.size = 0;
+        return store;
+    }
+    store.ready = true;
+    store.mapped = true;
+    return store;
+}
+
+id<MTLBuffer> loadBufferFromFile(id<MTLDevice> device, const std::string& path, bool* ok) {
     std::ifstream f(path, std::ios::binary | std::ios::ate);
     if (!f) {
         std::cerr << "Missing: " << path << "\n";
         *ok = false;
         return nil;
     }
-    size_t size = f.tellg(); f.seekg(0);
-    std::vector<uint16_t> data(size / 2);
-    f.read((char*)data.data(), size);
-    return [device newBufferWithBytes:data.data() length:size options:MTLResourceStorageModeShared];
+    size_t size = (size_t)f.tellg();
+    f.seekg(0);
+    id<MTLBuffer> buffer = [device newBufferWithLength:size options:MTLResourceStorageModeShared];
+    if (!buffer) {
+        *ok = false;
+        return nil;
+    }
+    f.read((char*)[buffer contents], (std::streamsize)size);
+    if (!f) {
+        std::cerr << "Failed to read: " << path << "\n";
+        *ok = false;
+        return nil;
+    }
+    return buffer;
+}
+
+id<MTLBuffer> loadWeightBuffer(id<MTLDevice> device,
+                               const std::string& dir,
+                               const std::string& filename,
+                               PackedWeightStore* packed,
+                               bool* ok) {
+    if (packed && packed->ready) {
+        auto it = packed->entries.find(filename);
+        if (it != packed->entries.end()) {
+            const auto& entry = it->second;
+            if (entry.offset + entry.size <= packed->size) {
+                void* source = (char*)packed->data + entry.offset;
+                id<MTLBuffer> buffer = [device newBufferWithBytesNoCopy:source
+                                                                  length:(NSUInteger)entry.size
+                                                                 options:MTLResourceStorageModeShared
+                                                             deallocator:nil];
+                if (buffer) return buffer;
+
+                buffer = [device newBufferWithLength:(NSUInteger)entry.size
+                                             options:MTLResourceStorageModeShared];
+                if (!buffer) {
+                    *ok = false;
+                    return nil;
+                }
+                memcpy([buffer contents], source, (size_t)entry.size);
+                return buffer;
+            }
+            std::cerr << "Invalid packed weight range: " << filename << "\n";
+            *ok = false;
+            return nil;
+        }
+    }
+    return loadBufferFromFile(device, dir + "/" + filename, ok);
+}
+
+id<MTLBuffer> loadPackedWeightSpan(id<MTLDevice> device,
+                                   PackedWeightStore* packed,
+                                   const std::vector<std::string>& filenames) {
+    if (!packed || !packed->ready || filenames.empty()) return nil;
+
+    uint64_t begin = 0;
+    uint64_t end = 0;
+    for (size_t index = 0; index < filenames.size(); index++) {
+        auto entry = packed->entries.find(filenames[index]);
+        if (entry == packed->entries.end()) return nil;
+        if (index == 0) {
+            begin = entry->second.offset;
+            end = begin;
+        }
+        if (entry->second.offset != end) return nil;
+        end += entry->second.size;
+    }
+    if (end > packed->size) return nil;
+
+    void* source = (char*)packed->data + begin;
+    return [device newBufferWithBytesNoCopy:source
+                                     length:(NSUInteger)(end - begin)
+                                    options:MTLResourceStorageModeShared
+                                deallocator:nil];
+}
+
+double prefetchPackedWeights(PackedWeightStore* packed,
+                             const std::vector<std::string>& filenames) {
+    if (!packed || !packed->ready || !packed->mapped || !packed->data) return 0.0;
+
+    auto started = std::chrono::high_resolution_clock::now();
+    volatile uint8_t sink = 0;
+    const size_t pageSize = 4096;
+
+    for (const std::string& filename : filenames) {
+        auto it = packed->entries.find(filename);
+        if (it == packed->entries.end()) continue;
+        const auto& entry = it->second;
+        if (entry.offset + entry.size > packed->size || entry.size == 0) continue;
+
+        const uint8_t* begin = (const uint8_t*)packed->data + entry.offset;
+        madvise((void*)begin, (size_t)entry.size, MADV_WILLNEED);
+
+        size_t offset = 0;
+        for (; offset < entry.size; offset += pageSize) {
+            sink ^= begin[offset];
+        }
+        sink ^= begin[entry.size - 1];
+    }
+
+    auto finished = std::chrono::high_resolution_clock::now();
+    return std::chrono::duration<double, std::milli>(finished - started).count();
 }
 
 void encodeKernel(id<MTLComputeCommandEncoder> enc,
@@ -141,14 +304,31 @@ std::vector<float> attention_head(const std::vector<float>& q,
 
 } 
 struct QwenEngine {
+    ~QwenEngine() {
+        if (mapped_weights_data && mapped_weights_size > 0) {
+            munmap(mapped_weights_data, mapped_weights_size);
+        }
+        if (mapped_weights_fd >= 0) {
+            close(mapped_weights_fd);
+        }
+    }
+
     bool verbose = false;
+    bool use_fused_attention = true;
+    bool use_grouped_gqa = true;
+    bool use_combined_prefill = false;
+    bool use_tiled_prefill = true;
     QwenBackend backend = QWEN_BACKEND_METAL_FP16;
+    void* mapped_weights_data = nullptr;
+    size_t mapped_weights_size = 0;
+    int mapped_weights_fd = -1;
 
     id<MTLDevice> device = nil;
     id<MTLCommandQueue> queue = nil;
     id<MTLComputePipelineState> pipeRmsNorm = nil;
     id<MTLComputePipelineState> pipeResAdd = nil;
     id<MTLComputePipelineState> pipeMatvec = nil;
+    id<MTLComputePipelineState> pipeQKVFp16 = nil;
     id<MTLComputePipelineState> pipeGateUp = nil;
     id<MTLComputePipelineState> pipeHalfToFloat = nil;
     id<MTLComputePipelineState> pipeSiluMul = nil;
@@ -164,6 +344,11 @@ struct QwenEngine {
     id<MTLComputePipelineState> pipeMulHalf = nil;
     id<MTLComputePipelineState> pipeRopeQK = nil;
     id<MTLComputePipelineState> pipeKVAppend = nil;
+    id<MTLComputePipelineState> pipeRopeKVAppend = nil;
+    id<MTLComputePipelineState> pipeAttnFused = nil;
+    id<MTLComputePipelineState> pipeAttnBlock = nil;
+    id<MTLComputePipelineState> pipeAttnBlockGQA = nil;
+    id<MTLComputePipelineState> pipeAttnBlockReduce = nil;
     id<MTLComputePipelineState> pipeAttnScores = nil;
     id<MTLComputePipelineState> pipeAttnSoftmax = nil;
     id<MTLComputePipelineState> pipeAttnWeighted = nil;
@@ -176,6 +361,16 @@ struct QwenEngine {
     id<MTLComputePipelineState> pipeCausalScores = nil;
     id<MTLComputePipelineState> pipeCausalSoftmax = nil;
     id<MTLComputePipelineState> pipeCausalWeighted = nil;
+    id<MTLComputePipelineState> pipeSplitQKVBiasBatch = nil;
+    id<MTLComputePipelineState> pipeGateUpSiluBatch = nil;
+    id<MTLComputePipelineState> pipeTiledPrefill = nil;
+    id<MTLComputePipelineState> pipeRopeBatchOffset = nil;
+    id<MTLComputePipelineState> pipeKVBatchOffset = nil;
+    id<MTLComputePipelineState> pipeCausalScoresOffset = nil;
+    id<MTLComputePipelineState> pipeCausalSoftmaxOffset = nil;
+    id<MTLComputePipelineState> pipeCausalWeightedOffset = nil;
+    id<MTLComputePipelineState> pipeArgmaxStage1 = nil;
+    id<MTLComputePipelineState> pipeArgmaxStage2 = nil;
 
     id<MTLBuffer> embed = nil;
     id<MTLBuffer> final_norm = nil;
@@ -196,6 +391,9 @@ struct QwenEngine {
     id<MTLBuffer> mlp_buf = nil;               
     id<MTLBuffer> final_hidden = nil;          
     id<MTLBuffer> logits_buf = nil;            
+    id<MTLBuffer> argmax_values_buf = nil;
+    id<MTLBuffer> argmax_ids_buf = nil;
+    id<MTLBuffer> selected_token_buf = nil;
 
     id<MTLBuffer> x_mlp_buf = nil;
     id<MTLBuffer> gate_out_buf = nil;
@@ -217,6 +415,9 @@ struct QwenEngine {
     MPSVector *gateHalfVec=nil, *upHalfVec=nil, *mlpMidHalfVec=nil, *downHalfVec=nil;
     std::vector<id<MTLBuffer>> k_cache_gpu, v_cache_gpu;
     id<MTLBuffer> attention_scores = nil;
+    id<MTLBuffer> attention_block_maxima = nil;
+    id<MTLBuffer> attention_block_sums = nil;
+    id<MTLBuffer> attention_block_outputs = nil;
     id<MTLBuffer> q_rotated = nil;
     int session_pos = 0;
     std::vector<int> session_tokens;
@@ -233,7 +434,13 @@ bool backendUsesQ4Projections(QwenBackend backend) {
 }
 
 bool backendUsesQ8Projections(QwenBackend backend) {
-    return backend == QWEN_BACKEND_METAL_INT8;
+    return backend == QWEN_BACKEND_METAL_INT8 ||
+           backend == QWEN_BACKEND_INT8_FP16_LM_HEAD;
+}
+
+bool backendUsesFp16LmHead(QwenBackend backend) {
+    return backend == QWEN_BACKEND_INT4_FP16_LM_HEAD ||
+           backend == QWEN_BACKEND_INT8_FP16_LM_HEAD;
 }
 
 bool backendUsesBatchedPrefill(QwenBackend backend) {
@@ -265,9 +472,57 @@ SamplerState makeSampler(const QwenSamplingParams& params,
     return state;
 }
 
+int selectGreedyTokenOnGpu(QwenEngine* eng) {
+    if (!eng->pipeArgmaxStage1 || !eng->pipeArgmaxStage2 ||
+        !eng->argmax_values_buf || !eng->argmax_ids_buf || !eng->selected_token_buf) {
+        return -1;
+    }
+
+    constexpr uint stage1Threads = 256;
+    constexpr uint stage2Threads = 512;
+    uint vocabSize = VOCAB_SIZE;
+    uint blockCount = (vocabSize + stage1Threads - 1) / stage1Threads;
+
+    id<MTLCommandBuffer> command = [eng->queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+
+    [encoder setComputePipelineState:eng->pipeArgmaxStage1];
+    [encoder setBuffer:eng->logits_buf offset:0 atIndex:0];
+    [encoder setBuffer:eng->argmax_values_buf offset:0 atIndex:1];
+    [encoder setBuffer:eng->argmax_ids_buf offset:0 atIndex:2];
+    [encoder setBytes:&vocabSize length:sizeof(vocabSize) atIndex:3];
+    [encoder setThreadgroupMemoryLength:stage1Threads * sizeof(float) atIndex:0];
+    [encoder setThreadgroupMemoryLength:stage1Threads * sizeof(uint) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake(blockCount, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(stage1Threads, 1, 1)];
+
+    [encoder setComputePipelineState:eng->pipeArgmaxStage2];
+    [encoder setBuffer:eng->argmax_values_buf offset:0 atIndex:0];
+    [encoder setBuffer:eng->argmax_ids_buf offset:0 atIndex:1];
+    [encoder setBuffer:eng->selected_token_buf offset:0 atIndex:2];
+    [encoder setBytes:&blockCount length:sizeof(blockCount) atIndex:3];
+    [encoder setThreadgroupMemoryLength:stage2Threads * sizeof(float) atIndex:0];
+    [encoder setThreadgroupMemoryLength:stage2Threads * sizeof(uint) atIndex:1];
+    [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
+         threadsPerThreadgroup:MTLSizeMake(stage2Threads, 1, 1)];
+
+    [encoder endEncoding];
+    [command commit];
+    [command waitUntilCompleted];
+
+    uint* selected = (uint*)[eng->selected_token_buf contents];
+    return (int)selected[0];
+}
+
 int selectTokenFromLogits(QwenEngine* eng, SamplerState* sampler) {
-    uint16_t* raw = (uint16_t*)[eng->logits_buf contents];
     QwenSamplingParams params = sampler ? sampler->params : greedySamplingParams();
+
+    if (!usesSampling(params) && !(params.repetition_penalty > 1.0f && sampler)) {
+        int token = selectGreedyTokenOnGpu(eng);
+        if (token >= 0) return token;
+    }
+
+    uint16_t* raw = (uint16_t*)[eng->logits_buf contents];
 
     std::vector<float> logits(VOCAB_SIZE);
     float maxValue = -INFINITY;
@@ -351,11 +606,11 @@ void encodeProjection(QwenEngine* eng, id<MTLComputeCommandEncoder> enc,
                       id<MTLBuffer> weight, id<MTLBuffer> scale,
                       id<MTLBuffer> input, id<MTLBuffer> output,
                       int outDim, int inDim) {
-    if (eng->backend == QWEN_BACKEND_METAL_FP16 || eng->backend == QWEN_BACKEND_MPS_FP16) {
+    if (eng->backend == QWEN_BACKEND_METAL_FP16 || eng->backend == QWEN_BACKEND_MPS_FP16 || scale == nil) {
         encodeMatvec(enc, eng->pipeMatvec, weight, input, output, outDim, inDim);
         return;
     }
-    if (eng->backend == QWEN_BACKEND_METAL_INT8) {
+    if (backendUsesQ8Projections(eng->backend)) {
         [enc setComputePipelineState:eng->pipeMatvecQ8];
         [enc setBuffer:weight offset:0 atIndex:0];
         [enc setBuffer:scale offset:0 atIndex:1];
@@ -382,6 +637,26 @@ void encodeProjection(QwenEngine* eng, id<MTLComputeCommandEncoder> enc,
        threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
 }
 
+void encodeQKVFp16(QwenEngine* eng, id<MTLComputeCommandEncoder> enc, LayerWeights& lw) {
+    [enc setComputePipelineState:eng->pipeQKVFp16];
+    [enc setBuffer:lw.q_proj offset:0 atIndex:0];
+    [enc setBuffer:lw.k_proj offset:0 atIndex:1];
+    [enc setBuffer:lw.v_proj offset:0 atIndex:2];
+    [enc setBuffer:eng->normed offset:0 atIndex:3];
+    [enc setBuffer:eng->q_buf offset:0 atIndex:4];
+    [enc setBuffer:eng->k_buf offset:0 atIndex:5];
+    [enc setBuffer:eng->v_buf offset:0 atIndex:6];
+    [enc setBuffer:lw.q_bias offset:0 atIndex:7];
+    [enc setBuffer:lw.k_bias offset:0 atIndex:8];
+    [enc setBuffer:lw.v_bias offset:0 atIndex:9];
+    uint K = HIDDEN_DIM;
+    [enc setBytes:&K length:sizeof(K) atIndex:10];
+    constexpr uint threads = 128;
+    [enc setThreadgroupMemoryLength:(threads / 32) * sizeof(float) atIndex:0];
+    [enc dispatchThreadgroups:MTLSizeMake(NUM_HEADS * HEAD_DIM + 2 * NUM_KV_HEADS * HEAD_DIM, 1, 1)
+       threadsPerThreadgroup:MTLSizeMake(threads, 1, 1)];
+}
+
 void encodeMPS(id<MTLCommandBuffer> cmd, MPSMatrixVectorMultiplication* kernel,
                MPSMatrix* matrix, MPSVector* input, MPSVector* output) {
     [kernel encodeToCommandBuffer:cmd inputMatrix:matrix inputVector:input resultVector:output];
@@ -402,56 +677,103 @@ int forward_step_gpu(QwenEngine* eng, int token_id, int current_pos, SamplerStat
         auto& lw = eng->layers[l];
         encodeRmsNorm(enc, eng->pipeRmsNorm, eng->hidden, lw.input_norm,
                       eng->normed, eng->hidden_dim_const_buf);
-        encodeProjection(eng, enc, lw.q_proj, lw.q_scale, eng->normed, eng->q_buf,
-                         NUM_HEADS * HEAD_DIM, HIDDEN_DIM);
-        encodeProjection(eng, enc, lw.k_proj, lw.k_scale, eng->normed, eng->k_buf,
-                         NUM_KV_HEADS * HEAD_DIM, HIDDEN_DIM);
-        encodeProjection(eng, enc, lw.v_proj, lw.v_scale, eng->normed, eng->v_buf,
-                         NUM_KV_HEADS * HEAD_DIM, HIDDEN_DIM);
-        encodeKernel(enc, eng->pipeResAdd, @[eng->q_buf, lw.q_bias], NUM_HEADS * HEAD_DIM);
-        encodeKernel(enc, eng->pipeResAdd, @[eng->k_buf, lw.k_bias], NUM_KV_HEADS * HEAD_DIM);
-        encodeKernel(enc, eng->pipeResAdd, @[eng->v_buf, lw.v_bias], NUM_KV_HEADS * HEAD_DIM);
+        if (eng->backend == QWEN_BACKEND_METAL_FP16) {
+            encodeQKVFp16(eng, enc, lw);
+        } else {
+            encodeProjection(eng, enc, lw.q_proj, lw.q_scale, eng->normed, eng->q_buf,
+                             NUM_HEADS * HEAD_DIM, HIDDEN_DIM);
+            encodeProjection(eng, enc, lw.k_proj, lw.k_scale, eng->normed, eng->k_buf,
+                             NUM_KV_HEADS * HEAD_DIM, HIDDEN_DIM);
+            encodeProjection(eng, enc, lw.v_proj, lw.v_scale, eng->normed, eng->v_buf,
+                             NUM_KV_HEADS * HEAD_DIM, HIDDEN_DIM);
+            encodeKernel(enc, eng->pipeResAdd, @[eng->q_buf, lw.q_bias], NUM_HEADS * HEAD_DIM);
+            encodeKernel(enc, eng->pipeResAdd, @[eng->k_buf, lw.k_bias], NUM_KV_HEADS * HEAD_DIM);
+            encodeKernel(enc, eng->pipeResAdd, @[eng->v_buf, lw.v_bias], NUM_KV_HEADS * HEAD_DIM);
+        }
 
-        [enc setComputePipelineState:eng->pipeRopeQK];
+        [enc setComputePipelineState:eng->pipeRopeKVAppend];
         [enc setBuffer:eng->q_buf offset:0 atIndex:0];
         [enc setBuffer:eng->k_buf offset:0 atIndex:1];
-        [enc setBuffer:eng->q_rotated offset:0 atIndex:2];
-        [enc setBytes:&position length:sizeof(position) atIndex:3];
+        [enc setBuffer:eng->v_buf offset:0 atIndex:2];
+        [enc setBuffer:eng->q_rotated offset:0 atIndex:3];
+        [enc setBuffer:eng->k_cache_gpu[l] offset:0 atIndex:4];
+        [enc setBuffer:eng->v_cache_gpu[l] offset:0 atIndex:5];
+        [enc setBytes:&position length:sizeof(position) atIndex:6];
         [enc dispatchThreads:MTLSizeMake((NUM_HEADS + NUM_KV_HEADS) * HEAD_DIM / 2, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
-        [enc setComputePipelineState:eng->pipeKVAppend];
-        [enc setBuffer:eng->k_buf offset:0 atIndex:0];
-        [enc setBuffer:eng->v_buf offset:0 atIndex:1];
-        [enc setBuffer:eng->k_cache_gpu[l] offset:0 atIndex:2];
-        [enc setBuffer:eng->v_cache_gpu[l] offset:0 atIndex:3];
-        [enc setBytes:&position length:sizeof(position) atIndex:4];
-        [enc dispatchThreads:MTLSizeMake(NUM_KV_HEADS * HEAD_DIM, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(128, 1, 1)];
+        if (eng->use_fused_attention && numTokens <= 2 * ATTENTION_BLOCK_SIZE) {
+            constexpr uint attentionThreads = 256;
+            [enc setComputePipelineState:eng->pipeAttnFused];
+            [enc setBuffer:eng->q_rotated offset:0 atIndex:0];
+            [enc setBuffer:eng->k_cache_gpu[l] offset:0 atIndex:1];
+            [enc setBuffer:eng->v_cache_gpu[l] offset:0 atIndex:2];
+            [enc setBuffer:eng->attn_buf offset:0 atIndex:3];
+            [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:4];
+            [enc setThreadgroupMemoryLength:(numTokens + attentionThreads / 32) * sizeof(float)
+                                    atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(NUM_HEADS, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(attentionThreads, 1, 1)];
+        } else if (eng->use_fused_attention) {
+            uint attentionBlocks =
+                (numTokens + ATTENTION_BLOCK_SIZE - 1) / ATTENTION_BLOCK_SIZE;
+            bool useGroupedGQA = eng->use_grouped_gqa &&
+                attentionBlocks >= GROUPED_GQA_MIN_BLOCKS;
+            [enc setComputePipelineState:useGroupedGQA
+                ? eng->pipeAttnBlockGQA
+                : eng->pipeAttnBlock];
+            [enc setBuffer:eng->q_rotated offset:0 atIndex:0];
+            [enc setBuffer:eng->k_cache_gpu[l] offset:0 atIndex:1];
+            [enc setBuffer:eng->v_cache_gpu[l] offset:0 atIndex:2];
+            [enc setBuffer:eng->attention_block_maxima offset:0 atIndex:3];
+            [enc setBuffer:eng->attention_block_sums offset:0 atIndex:4];
+            [enc setBuffer:eng->attention_block_outputs offset:0 atIndex:5];
+            [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:6];
+            [enc setBytes:&attentionBlocks length:sizeof(attentionBlocks) atIndex:7];
+            uint scratchFloats = useGroupedGQA
+                ? 2 * ATTENTION_BLOCK_SIZE + 8
+                : ATTENTION_BLOCK_SIZE + 8;
+            [enc setThreadgroupMemoryLength:scratchFloats * sizeof(float)
+                                    atIndex:0];
+            uint attentionGroups = useGroupedGQA
+                ? NUM_KV_HEADS * ((NUM_HEADS / NUM_KV_HEADS + 1) / 2)
+                : NUM_HEADS;
+            [enc dispatchThreadgroups:MTLSizeMake(attentionBlocks, attentionGroups, 1)
+                 threadsPerThreadgroup:MTLSizeMake(ATTENTION_BLOCK_SIZE, 1, 1)];
 
-        [enc setComputePipelineState:eng->pipeAttnScores];
-        [enc setBuffer:eng->q_rotated offset:0 atIndex:0];
-        [enc setBuffer:eng->k_cache_gpu[l] offset:0 atIndex:1];
-        [enc setBuffer:eng->attention_scores offset:0 atIndex:2];
-        [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:3];
-        [enc dispatchThreadgroups:MTLSizeMake(numTokens, NUM_HEADS, 1)
-             threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
+            [enc setComputePipelineState:eng->pipeAttnBlockReduce];
+            [enc setBuffer:eng->attention_block_maxima offset:0 atIndex:0];
+            [enc setBuffer:eng->attention_block_sums offset:0 atIndex:1];
+            [enc setBuffer:eng->attention_block_outputs offset:0 atIndex:2];
+            [enc setBuffer:eng->attn_buf offset:0 atIndex:3];
+            [enc setBytes:&attentionBlocks length:sizeof(attentionBlocks) atIndex:4];
+            [enc dispatchThreadgroups:MTLSizeMake(NUM_HEADS, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+        } else {
+            [enc setComputePipelineState:eng->pipeAttnScores];
+            [enc setBuffer:eng->q_rotated offset:0 atIndex:0];
+            [enc setBuffer:eng->k_cache_gpu[l] offset:0 atIndex:1];
+            [enc setBuffer:eng->attention_scores offset:0 atIndex:2];
+            [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:3];
+            [enc dispatchThreadgroups:MTLSizeMake(numTokens, NUM_HEADS, 1)
+                 threadsPerThreadgroup:MTLSizeMake(32, 1, 1)];
 
-        [enc setComputePipelineState:eng->pipeAttnSoftmax];
-        [enc setBuffer:eng->attention_scores offset:0 atIndex:0];
-        [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:1];
-        uint softmaxThreads = std::min(256u, std::max(32u, ((numTokens + 31) / 32) * 32));
-        [enc setThreadgroupMemoryLength:(softmaxThreads / 32) * sizeof(float) atIndex:0];
-        [enc dispatchThreadgroups:MTLSizeMake(NUM_HEADS, 1, 1)
-             threadsPerThreadgroup:MTLSizeMake(softmaxThreads, 1, 1)];
+            [enc setComputePipelineState:eng->pipeAttnSoftmax];
+            [enc setBuffer:eng->attention_scores offset:0 atIndex:0];
+            [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:1];
+            uint softmaxThreads = std::min(256u, std::max(32u, ((numTokens + 31) / 32) * 32));
+            [enc setThreadgroupMemoryLength:(softmaxThreads / 32) * sizeof(float) atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(NUM_HEADS, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(softmaxThreads, 1, 1)];
 
-        [enc setComputePipelineState:eng->pipeAttnWeighted];
-        [enc setBuffer:eng->attention_scores offset:0 atIndex:0];
-        [enc setBuffer:eng->v_cache_gpu[l] offset:0 atIndex:1];
-        [enc setBuffer:eng->attn_buf offset:0 atIndex:2];
-        [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:3];
-        [enc dispatchThreads:MTLSizeMake(HEAD_DIM, NUM_HEADS, 1)
-             threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+            [enc setComputePipelineState:eng->pipeAttnWeighted];
+            [enc setBuffer:eng->attention_scores offset:0 atIndex:0];
+            [enc setBuffer:eng->v_cache_gpu[l] offset:0 atIndex:1];
+            [enc setBuffer:eng->attn_buf offset:0 atIndex:2];
+            [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:3];
+            [enc dispatchThreads:MTLSizeMake(HEAD_DIM, NUM_HEADS, 1)
+                 threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+        }
 
         encodeProjection(eng, enc, lw.o_proj, lw.o_scale, eng->attn_buf, eng->attn_proj,
                          HIDDEN_DIM, NUM_HEADS * HEAD_DIM);
@@ -469,7 +791,7 @@ int forward_step_gpu(QwenEngine* eng, int token_id, int current_pos, SamplerStat
             [enc setBuffer:eng->gate_out_buf offset:0 atIndex:3];
             [enc setBuffer:eng->up_out_buf offset:0 atIndex:4];
             [enc setBytes:&gateK length:sizeof(gateK) atIndex:5];
-        } else if (eng->backend == QWEN_BACKEND_METAL_INT8) {
+        } else if (backendUsesQ8Projections(eng->backend)) {
             [enc setComputePipelineState:eng->pipeGateUpQ8];
             [enc setBuffer:lw.gate offset:0 atIndex:0];
             [enc setBuffer:lw.gate_scale offset:0 atIndex:1];
@@ -503,7 +825,7 @@ int forward_step_gpu(QwenEngine* eng, int token_id, int current_pos, SamplerStat
             [enc setBuffer:eng->mlp_mid_buf offset:0 atIndex:1];
             [enc setBuffer:eng->down_out_buf offset:0 atIndex:2];
             [enc setBytes:&downK length:sizeof(downK) atIndex:3];
-        } else if (eng->backend == QWEN_BACKEND_METAL_INT8) {
+        } else if (backendUsesQ8Projections(eng->backend)) {
             [enc setComputePipelineState:eng->pipeDownQ8];
             [enc setBuffer:lw.down offset:0 atIndex:0];
             [enc setBuffer:lw.down_scale offset:0 atIndex:1];
@@ -533,8 +855,10 @@ int forward_step_gpu(QwenEngine* eng, int token_id, int current_pos, SamplerStat
     return selectTokenFromLogits(eng, sampler);
 }
 
-int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, SamplerState* sampler) {
+int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, int start_pos, SamplerState* sampler) {
     id<MTLDevice> device = eng->device;
+    bool useTiledPrefill = eng->use_tiled_prefill &&
+        token_count >= TILED_PREFILL_MIN_TOKENS;
     auto halfBuffer = [&](size_t elements) {
         return [device newBufferWithLength:elements * sizeof(uint16_t)
                                     options:MTLResourceStorageModeShared];
@@ -555,11 +879,24 @@ int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, S
     id<MTLBuffer> attention = halfBuffer((size_t)token_count * HIDDEN_DIM);
     id<MTLBuffer> attentionProjected = halfBuffer((size_t)token_count * HIDDEN_DIM);
     id<MTLBuffer> normed2 = halfBuffer((size_t)token_count * HIDDEN_DIM);
-    id<MTLBuffer> gate = halfBuffer((size_t)token_count * INTERMEDIATE);
-    id<MTLBuffer> up = halfBuffer((size_t)token_count * INTERMEDIATE);
+    id<MTLBuffer> qkvCombined = eng->use_combined_prefill
+        ? halfBuffer((size_t)token_count * (HIDDEN_DIM + 2 * NUM_KV_HEADS * HEAD_DIM))
+        : nil;
+    id<MTLBuffer> gateUpCombined = eng->use_combined_prefill
+        ? halfBuffer((size_t)token_count * 2 * INTERMEDIATE)
+        : nil;
+    id<MTLBuffer> gate = eng->use_combined_prefill
+        ? nil
+        : halfBuffer((size_t)token_count * INTERMEDIATE);
+    id<MTLBuffer> up = eng->use_combined_prefill
+        ? nil
+        : halfBuffer((size_t)token_count * INTERMEDIATE);
     id<MTLBuffer> middle = halfBuffer((size_t)token_count * INTERMEDIATE);
     id<MTLBuffer> down = halfBuffer((size_t)token_count * HIDDEN_DIM);
-    id<MTLBuffer> scores = floatBuffer((size_t)token_count * NUM_HEADS * token_count);
+    int total_token_count = start_pos + token_count;
+    id<MTLBuffer> scores = useTiledPrefill
+        ? nil
+        : floatBuffer((size_t)token_count * NUM_HEADS * total_token_count);
 
     auto matrix = [&](id<MTLBuffer> buffer, int rows, int columns) -> MPSMatrix* {
         auto* descriptor = [MPSMatrixDescriptor matrixDescriptorWithRows:rows columns:columns
@@ -567,14 +904,28 @@ int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, S
         return [[MPSMatrix alloc] initWithBuffer:buffer descriptor:descriptor];
     };
     MPSMatrix* normedM = matrix(normed, token_count, HIDDEN_DIM);
-    MPSMatrix* qM = matrix(q, token_count, HIDDEN_DIM);
-    MPSMatrix* kM = matrix(k, token_count, NUM_KV_HEADS * HEAD_DIM);
-    MPSMatrix* vM = matrix(v, token_count, NUM_KV_HEADS * HEAD_DIM);
+    MPSMatrix* qM = eng->use_combined_prefill ? nil : matrix(q, token_count, HIDDEN_DIM);
+    MPSMatrix* kM = eng->use_combined_prefill
+        ? nil
+        : matrix(k, token_count, NUM_KV_HEADS * HEAD_DIM);
+    MPSMatrix* vM = eng->use_combined_prefill
+        ? nil
+        : matrix(v, token_count, NUM_KV_HEADS * HEAD_DIM);
+    MPSMatrix* qkvCombinedM = eng->use_combined_prefill
+        ? matrix(qkvCombined, token_count, HIDDEN_DIM + 2 * NUM_KV_HEADS * HEAD_DIM)
+        : nil;
     MPSMatrix* attentionM = matrix(attention, token_count, HIDDEN_DIM);
     MPSMatrix* attentionProjectedM = matrix(attentionProjected, token_count, HIDDEN_DIM);
     MPSMatrix* normed2M = matrix(normed2, token_count, HIDDEN_DIM);
-    MPSMatrix* gateM = matrix(gate, token_count, INTERMEDIATE);
-    MPSMatrix* upM = matrix(up, token_count, INTERMEDIATE);
+    MPSMatrix* gateM = eng->use_combined_prefill
+        ? nil
+        : matrix(gate, token_count, INTERMEDIATE);
+    MPSMatrix* upM = eng->use_combined_prefill
+        ? nil
+        : matrix(up, token_count, INTERMEDIATE);
+    MPSMatrix* gateUpCombinedM = eng->use_combined_prefill
+        ? matrix(gateUpCombined, token_count, 2 * INTERMEDIATE)
+        : nil;
     MPSMatrix* middleM = matrix(middle, token_count, INTERMEDIATE);
     MPSMatrix* downM = matrix(down, token_count, HIDDEN_DIM);
 
@@ -586,6 +937,12 @@ int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, S
     MPSMatrixMultiplication* hh = multiplication(HIDDEN_DIM, HIDDEN_DIM);
     MPSMatrixMultiplication* hkv = multiplication(NUM_KV_HEADS * HEAD_DIM, HIDDEN_DIM);
     MPSMatrixMultiplication* hi = multiplication(INTERMEDIATE, HIDDEN_DIM);
+    MPSMatrixMultiplication* hqkv = eng->use_combined_prefill
+        ? multiplication(HIDDEN_DIM + 2 * NUM_KV_HEADS * HEAD_DIM, HIDDEN_DIM)
+        : nil;
+    MPSMatrixMultiplication* hgateUp = eng->use_combined_prefill
+        ? multiplication(2 * INTERMEDIATE, HIDDEN_DIM)
+        : nil;
     MPSMatrixMultiplication* ih = multiplication(HIDDEN_DIM, INTERMEDIATE);
     auto multiply = [&](id<MTLCommandBuffer> command, MPSMatrixMultiplication* operation,
                         MPSMatrix* input, MPSMatrix* weight, MPSMatrix* output) {
@@ -595,6 +952,8 @@ int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, S
     id<MTLCommandBuffer> command = [eng->queue commandBuffer];
     id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
     uint tokens = (uint)token_count;
+    uint start = (uint)start_pos;
+    uint totalTokens = (uint)total_token_count;
     [encoder setComputePipelineState:eng->pipeEmbeddingBatch];
     [encoder setBuffer:tokenBuffer offset:0 atIndex:0];
     [encoder setBuffer:eng->embed offset:0 atIndex:1];
@@ -636,43 +995,94 @@ int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, S
         encoder = [command computeCommandEncoder];
         rmsBatch(encoder, hidden, lw.input_norm, normed);
         [encoder endEncoding];
-        multiply(command, hh, normedM, lw.q_matrix, qM);
-        multiply(command, hkv, normedM, lw.k_matrix, kM);
-        multiply(command, hkv, normedM, lw.v_matrix, vM);
+        if (eng->use_combined_prefill) {
+            multiply(command, hqkv, normedM, lw.qkv_matrix, qkvCombinedM);
+        } else {
+            multiply(command, hh, normedM, lw.q_matrix, qM);
+            multiply(command, hkv, normedM, lw.k_matrix, kM);
+            multiply(command, hkv, normedM, lw.v_matrix, vM);
+        }
 
         encoder = [command computeCommandEncoder];
-        biasBatch(encoder, q, lw.q_bias, HIDDEN_DIM);
-        biasBatch(encoder, k, lw.k_bias, NUM_KV_HEADS * HEAD_DIM);
-        biasBatch(encoder, v, lw.v_bias, NUM_KV_HEADS * HEAD_DIM);
-        [encoder setComputePipelineState:eng->pipeRopeBatch];
+        if (eng->use_combined_prefill) {
+            [encoder setComputePipelineState:eng->pipeSplitQKVBiasBatch];
+            [encoder setBuffer:qkvCombined offset:0 atIndex:0];
+            [encoder setBuffer:lw.q_bias offset:0 atIndex:1];
+            [encoder setBuffer:lw.k_bias offset:0 atIndex:2];
+            [encoder setBuffer:lw.v_bias offset:0 atIndex:3];
+            [encoder setBuffer:q offset:0 atIndex:4];
+            [encoder setBuffer:k offset:0 atIndex:5];
+            [encoder setBuffer:v offset:0 atIndex:6];
+            [encoder setBytes:&tokens length:sizeof(tokens) atIndex:7];
+            [encoder dispatchThreads:MTLSizeMake(
+                tokens * (HIDDEN_DIM + 2 * NUM_KV_HEADS * HEAD_DIM), 1, 1)
+                  threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            biasBatch(encoder, q, lw.q_bias, HIDDEN_DIM);
+            biasBatch(encoder, k, lw.k_bias, NUM_KV_HEADS * HEAD_DIM);
+            biasBatch(encoder, v, lw.v_bias, NUM_KV_HEADS * HEAD_DIM);
+        }
+        [encoder setComputePipelineState:start_pos == 0 ? eng->pipeRopeBatch : eng->pipeRopeBatchOffset];
         [encoder setBuffer:q offset:0 atIndex:0]; [encoder setBuffer:k offset:0 atIndex:1];
         [encoder setBuffer:qRotated offset:0 atIndex:2]; [encoder setBytes:&tokens length:4 atIndex:3];
+        if (start_pos != 0) [encoder setBytes:&start length:4 atIndex:4];
         [encoder dispatchThreads:MTLSizeMake(tokens * (NUM_HEADS + NUM_KV_HEADS) * HEAD_DIM / 2, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [encoder setComputePipelineState:eng->pipeKVBatch];
+        [encoder setComputePipelineState:start_pos == 0 ? eng->pipeKVBatch : eng->pipeKVBatchOffset];
         [encoder setBuffer:k offset:0 atIndex:0]; [encoder setBuffer:v offset:0 atIndex:1];
         [encoder setBuffer:eng->k_cache_gpu[layer] offset:0 atIndex:2];
         [encoder setBuffer:eng->v_cache_gpu[layer] offset:0 atIndex:3];
         [encoder setBytes:&tokens length:4 atIndex:4];
+        if (start_pos != 0) [encoder setBytes:&start length:4 atIndex:5];
         [encoder dispatchThreads:MTLSizeMake(tokens * NUM_KV_HEADS * HEAD_DIM, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [encoder setComputePipelineState:eng->pipeCausalScores];
-        [encoder setBuffer:qRotated offset:0 atIndex:0];
-        [encoder setBuffer:eng->k_cache_gpu[layer] offset:0 atIndex:1];
-        [encoder setBuffer:scores offset:0 atIndex:2]; [encoder setBytes:&tokens length:4 atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(tokens, NUM_HEADS, tokens)
-             threadsPerThreadgroup:MTLSizeMake(8, 2, 2)];
-        [encoder setComputePipelineState:eng->pipeCausalSoftmax];
-        [encoder setBuffer:scores offset:0 atIndex:0]; [encoder setBytes:&tokens length:4 atIndex:1];
-        [encoder setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
-        [encoder dispatchThreadgroups:MTLSizeMake(NUM_HEADS, tokens, 1)
-             threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-        [encoder setComputePipelineState:eng->pipeCausalWeighted];
-        [encoder setBuffer:scores offset:0 atIndex:0];
-        [encoder setBuffer:eng->v_cache_gpu[layer] offset:0 atIndex:1];
-        [encoder setBuffer:attention offset:0 atIndex:2]; [encoder setBytes:&tokens length:4 atIndex:3];
-        [encoder dispatchThreads:MTLSizeMake(HEAD_DIM, NUM_HEADS, tokens)
-             threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+        if (useTiledPrefill) {
+            uint queryTiles = (tokens + 7) / 8;
+            [encoder setComputePipelineState:eng->pipeTiledPrefill];
+            [encoder setBuffer:qRotated offset:0 atIndex:0];
+            [encoder setBuffer:eng->k_cache_gpu[layer] offset:0 atIndex:1];
+            [encoder setBuffer:eng->v_cache_gpu[layer] offset:0 atIndex:2];
+            [encoder setBuffer:attention offset:0 atIndex:3];
+            [encoder setBytes:&tokens length:sizeof(tokens) atIndex:4];
+            [encoder setBytes:&start length:sizeof(start) atIndex:5];
+            [encoder setThreadgroupMemoryLength:
+                (8 * HEAD_DIM + 8 * 32 + 2 * 8 * HEAD_DIM + 4 * 8) * sizeof(float)
+                                        atIndex:0];
+            [encoder setThreadgroupMemoryLength:32 * HEAD_DIM * sizeof(uint16_t)
+                                        atIndex:1];
+            [encoder dispatchThreadgroups:MTLSizeMake(queryTiles, NUM_HEADS, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            [encoder setComputePipelineState:start_pos == 0 ? eng->pipeCausalScores : eng->pipeCausalScoresOffset];
+            [encoder setBuffer:qRotated offset:0 atIndex:0];
+            [encoder setBuffer:eng->k_cache_gpu[layer] offset:0 atIndex:1];
+            [encoder setBuffer:scores offset:0 atIndex:2]; [encoder setBytes:&tokens length:4 atIndex:3];
+            if (start_pos != 0) {
+                [encoder setBytes:&totalTokens length:4 atIndex:4];
+                [encoder setBytes:&start length:4 atIndex:5];
+            }
+            [encoder dispatchThreads:MTLSizeMake(totalTokens, NUM_HEADS, tokens)
+                 threadsPerThreadgroup:MTLSizeMake(8, 2, 2)];
+            [encoder setComputePipelineState:start_pos == 0 ? eng->pipeCausalSoftmax : eng->pipeCausalSoftmaxOffset];
+            [encoder setBuffer:scores offset:0 atIndex:0]; [encoder setBytes:&tokens length:4 atIndex:1];
+            if (start_pos != 0) {
+                [encoder setBytes:&totalTokens length:4 atIndex:2];
+                [encoder setBytes:&start length:4 atIndex:3];
+            }
+            [encoder setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
+            [encoder dispatchThreadgroups:MTLSizeMake(NUM_HEADS, tokens, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            [encoder setComputePipelineState:start_pos == 0 ? eng->pipeCausalWeighted : eng->pipeCausalWeightedOffset];
+            [encoder setBuffer:scores offset:0 atIndex:0];
+            [encoder setBuffer:eng->v_cache_gpu[layer] offset:0 atIndex:1];
+            [encoder setBuffer:attention offset:0 atIndex:2]; [encoder setBytes:&tokens length:4 atIndex:3];
+            if (start_pos != 0) {
+                [encoder setBytes:&totalTokens length:4 atIndex:4];
+                [encoder setBytes:&start length:4 atIndex:5];
+            }
+            [encoder dispatchThreads:MTLSizeMake(HEAD_DIM, NUM_HEADS, tokens)
+                 threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+        }
         [encoder endEncoding];
 
         multiply(command, hh, attentionM, lw.o_matrix, attentionProjectedM);
@@ -680,11 +1090,24 @@ int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, S
         residualBatch(encoder, hidden, attentionProjected);
         rmsBatch(encoder, hidden, lw.post_norm, normed2);
         [encoder endEncoding];
-        multiply(command, hi, normed2M, lw.gate_matrix, gateM);
-        multiply(command, hi, normed2M, lw.up_matrix, upM);
+        if (eng->use_combined_prefill) {
+            multiply(command, hgateUp, normed2M, lw.gate_up_matrix, gateUpCombinedM);
+        } else {
+            multiply(command, hi, normed2M, lw.gate_matrix, gateM);
+            multiply(command, hi, normed2M, lw.up_matrix, upM);
+        }
         encoder = [command computeCommandEncoder];
-        encodeKernel(encoder, eng->pipeSiluHalf, @[gate], tokens * INTERMEDIATE);
-        encodeKernel(encoder, eng->pipeMulHalf, @[gate, up, middle], tokens * INTERMEDIATE);
+        if (eng->use_combined_prefill) {
+            [encoder setComputePipelineState:eng->pipeGateUpSiluBatch];
+            [encoder setBuffer:gateUpCombined offset:0 atIndex:0];
+            [encoder setBuffer:middle offset:0 atIndex:1];
+            [encoder setBytes:&tokens length:sizeof(tokens) atIndex:2];
+            [encoder dispatchThreads:MTLSizeMake(tokens * INTERMEDIATE, 1, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+        } else {
+            encodeKernel(encoder, eng->pipeSiluHalf, @[gate], tokens * INTERMEDIATE);
+            encodeKernel(encoder, eng->pipeMulHalf, @[gate, up, middle], tokens * INTERMEDIATE);
+        }
         [encoder endEncoding];
         multiply(command, ih, middleM, lw.down_matrix, downM);
         encoder = [command computeCommandEncoder];
@@ -857,7 +1280,7 @@ int forward_step(QwenEngine* eng,
             [mlpEnc setBuffer:eng->gate_out_buf offset:0 atIndex:3];
             [mlpEnc setBuffer:eng->up_out_buf offset:0 atIndex:4];
             [mlpEnc setBytes:&gateK length:sizeof(gateK) atIndex:5];
-        } else if (eng->backend == QWEN_BACKEND_METAL_INT8) {
+        } else if (backendUsesQ8Projections(eng->backend)) {
             [mlpEnc setComputePipelineState:eng->pipeGateUpQ8];
             [mlpEnc setBuffer:lw.gate offset:0 atIndex:0];
             [mlpEnc setBuffer:lw.gate_scale offset:0 atIndex:1];
@@ -892,7 +1315,7 @@ int forward_step(QwenEngine* eng,
             [mlpEnc setBuffer:eng->mlp_mid_buf offset:0 atIndex:1];
             [mlpEnc setBuffer:eng->down_out_buf offset:0 atIndex:2];
             [mlpEnc setBytes:&downK length:sizeof(downK) atIndex:3];
-        } else if (eng->backend == QWEN_BACKEND_METAL_INT8) {
+        } else if (backendUsesQ8Projections(eng->backend)) {
             [mlpEnc setComputePipelineState:eng->pipeDownQ8];
             [mlpEnc setBuffer:lw.down offset:0 atIndex:0];
             [mlpEnc setBuffer:lw.down_scale offset:0 atIndex:1];
@@ -925,7 +1348,7 @@ int forward_step(QwenEngine* eng,
                   eng->finalHiddenVec, eng->logitsVec);
         [outputCmd commit];
         [outputCmd waitUntilCompleted];
-    } else if (eng->backend == QWEN_BACKEND_INT4_FP16_LM_HEAD) {
+    } else if (backendUsesFp16LmHead(eng->backend)) {
         encodeMatvec(outputEnc, eng->pipeMatvec, eng->lm_head,
                      eng->final_hidden, eng->logits_buf, VOCAB_SIZE, HIDDEN_DIM);
         finishAndWait(outputCmd, outputEnc);
@@ -945,9 +1368,47 @@ extern "C" {
 QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
                                              QwenBackend backend,
                                              bool verbose) {
+    using Clock = std::chrono::high_resolution_clock;
+    bool startupTiming = false;
+    if (const char* value = std::getenv("QWEN_STARTUP_TIMING")) {
+        startupTiming = std::string(value) == "1";
+    }
+    bool warmupWeights = false;
+    if (const char* value = std::getenv("QWEN_WARMUP_WEIGHTS")) {
+        warmupWeights = std::string(value) == "1";
+    }
+    bool useFusedAttention = true;
+    if (const char* value = std::getenv("QWEN_FUSED_ATTENTION")) {
+        useFusedAttention = std::string(value) != "0";
+    }
+    bool useGroupedGQA = true;
+    if (const char* value = std::getenv("QWEN_GROUPED_GQA")) {
+        useGroupedGQA = std::string(value) != "0";
+    }
+    bool useCombinedPrefill = true;
+    if (const char* value = std::getenv("QWEN_COMBINED_PREFILL")) {
+        useCombinedPrefill = std::string(value) != "0";
+    }
+    bool useTiledPrefill = true;
+    if (const char* value = std::getenv("QWEN_TILED_PREFILL")) {
+        useTiledPrefill = std::string(value) != "0";
+    }
+    auto startupStarted = Clock::now();
+    auto phaseStarted = startupStarted;
+    auto printPhase = [&](const char* name) {
+        if (!startupTiming) return;
+        auto now = Clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - phaseStarted).count();
+        std::cerr << "[startup] " << name << ": " << ms << " ms" << std::endl;
+        phaseStarted = now;
+    };
+
     auto* eng = new QwenEngine();
     eng->verbose = verbose;
     eng->backend = backend;
+    eng->use_fused_attention = useFusedAttention;
+    eng->use_grouped_gqa = useGroupedGQA;
+    eng->use_tiled_prefill = useTiledPrefill;
 
     eng->device = MTLCreateSystemDefaultDevice();
     if (!eng->device) { LOG(eng, "[qwen_engine] no Metal device found"); delete eng; return nullptr; }
@@ -955,565 +1416,64 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
 
     id<MTLLibrary> library = [eng->device newDefaultLibrary];
     if (!library) { LOG(eng, "[qwen_engine] default.metallib not found"); delete eng; return nullptr; }
-
-    static const char* optimizedMetalSource = R"METAL(
-#include <metal_stdlib>
-using namespace metal;
-
-kernel void matvec_q4(device const uchar* weights [[buffer(0)]],
-                      device const half* scales [[buffer(1)]],
-                      device const half* x [[buffer(2)]],
-                      device half* y [[buffer(3)]],
-                      constant uint& K [[buffer(4)]],
-                      threadgroup float* partial [[threadgroup(0)]],
-                      uint row [[threadgroup_position_in_grid]],
-                      uint tid [[thread_position_in_threadgroup]],
-                      uint threads [[threads_per_threadgroup]]) {
-    const uint packed_cols = K / 2;
-    const uint scale_groups = K / 64;
-    float sum = 0.0f;
-
-    for (uint packed_col = tid; packed_col < packed_cols; packed_col += threads) {
-        uchar packed = weights[row * packed_cols + packed_col];
-        float scale = float(scales[row * scale_groups + packed_col / 32]);
-
-        float w0 = float(int(packed & 15) - 8);
-        float w1 = float(int(packed >> 4) - 8);
-        float x0 = float(x[2 * packed_col]);
-        float x1 = float(x[2 * packed_col + 1]);
-
-        sum += scale * (w0 * x0 + w1 * x1);
-    }
-
-    sum = simd_sum(sum);
-    if ((tid & 31u) == 0) {
-        partial[tid / 32] = sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint i = 0; i < threads / 32; i++) {
-            total += partial[i];
-        }
-        y[row] = half(total);
-    }
-}
-
-kernel void gate_up_q4(device const uchar* gate_weights [[buffer(0)]],
-                       device const half* gate_scales [[buffer(1)]],
-                       device const uchar* up_weights [[buffer(2)]],
-                       device const half* up_scales [[buffer(3)]],
-                       device const float* x [[buffer(4)]],
-                       device float* gate_out [[buffer(5)]],
-                       device float* up_out [[buffer(6)]],
-                       constant uint& K [[buffer(7)]],
-                       threadgroup float* partial [[threadgroup(0)]],
-                       uint row [[threadgroup_position_in_grid]],
-                       uint tid [[thread_position_in_threadgroup]],
-                       uint threads [[threads_per_threadgroup]]) {
-    const uint packed_cols = K / 2;
-    const uint scale_groups = K / 64;
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-
-    for (uint packed_col = tid; packed_col < packed_cols; packed_col += threads) {
-        uchar gate_packed = gate_weights[row * packed_cols + packed_col];
-        uchar up_packed = up_weights[row * packed_cols + packed_col];
-        uint scale_index = row * scale_groups + packed_col / 32;
-
-        float x0 = x[2 * packed_col];
-        float x1 = x[2 * packed_col + 1];
-
-        gate_sum += float(gate_scales[scale_index]) *
-                    (float(int(gate_packed & 15) - 8) * x0 +
-                     float(int(gate_packed >> 4) - 8) * x1);
-        up_sum += float(up_scales[scale_index]) *
-                  (float(int(up_packed & 15) - 8) * x0 +
-                   float(int(up_packed >> 4) - 8) * x1);
-    }
-
-    gate_sum = simd_sum(gate_sum);
-    up_sum = simd_sum(up_sum);
-
-    if ((tid & 31u) == 0) {
-        uint warp = tid / 32;
-        partial[warp * 2] = gate_sum;
-        partial[warp * 2 + 1] = up_sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float gate_total = 0.0f;
-        float up_total = 0.0f;
-        for (uint i = 0; i < threads / 32; i++) {
-            gate_total += partial[i * 2];
-            up_total += partial[i * 2 + 1];
-        }
-        gate_out[row] = gate_total;
-        up_out[row] = up_total;
-    }
-}
-
-kernel void down_q4(device const uchar* weights [[buffer(0)]],
-                    device const half* scales [[buffer(1)]],
-                    device const float* x [[buffer(2)]],
-                    device float* y [[buffer(3)]],
-                    constant uint& K [[buffer(4)]],
-                    threadgroup float* partial [[threadgroup(0)]],
-                    uint row [[threadgroup_position_in_grid]],
-                    uint tid [[thread_position_in_threadgroup]],
-                    uint threads [[threads_per_threadgroup]]) {
-    const uint packed_cols = K / 2;
-    const uint scale_groups = K / 64;
-    float sum = 0.0f;
-
-    for (uint packed_col = tid; packed_col < packed_cols; packed_col += threads) {
-        uchar packed = weights[row * packed_cols + packed_col];
-        float scale = float(scales[row * scale_groups + packed_col / 32]);
-
-        sum += scale *
-               (float(int(packed & 15) - 8) * x[2 * packed_col] +
-                float(int(packed >> 4) - 8) * x[2 * packed_col + 1]);
-    }
-
-    sum = simd_sum(sum);
-    if ((tid & 31u) == 0) {
-        partial[tid / 32] = sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint i = 0; i < threads / 32; i++) {
-            total += partial[i];
-        }
-        y[row] = total;
-    }
-}
-
-kernel void matvec_q8(device const char* weights [[buffer(0)]],
-                      device const half* scales [[buffer(1)]],
-                      device const half* x [[buffer(2)]],
-                      device half* y [[buffer(3)]],
-                      constant uint& K [[buffer(4)]],
-                      threadgroup float* partial [[threadgroup(0)]],
-                      uint row [[threadgroup_position_in_grid]],
-                      uint tid [[thread_position_in_threadgroup]],
-                      uint threads [[threads_per_threadgroup]]) {
-    const uint scale_groups = K / 64;
-    float sum = 0.0f;
-
-    for (uint col = tid; col < K; col += threads) {
-        float scale = float(scales[row * scale_groups + col / 64]);
-        sum += scale * float(weights[row * K + col]) * float(x[col]);
-    }
-
-    sum = simd_sum(sum);
-    if ((tid & 31u) == 0) {
-        partial[tid / 32] = sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint i = 0; i < threads / 32; i++) {
-            total += partial[i];
-        }
-        y[row] = half(total);
-    }
-}
-
-kernel void gate_up_q8(device const char* gate_weights [[buffer(0)]],
-                       device const half* gate_scales [[buffer(1)]],
-                       device const char* up_weights [[buffer(2)]],
-                       device const half* up_scales [[buffer(3)]],
-                       device const float* x [[buffer(4)]],
-                       device float* gate_out [[buffer(5)]],
-                       device float* up_out [[buffer(6)]],
-                       constant uint& K [[buffer(7)]],
-                       threadgroup float* partial [[threadgroup(0)]],
-                       uint row [[threadgroup_position_in_grid]],
-                       uint tid [[thread_position_in_threadgroup]],
-                       uint threads [[threads_per_threadgroup]]) {
-    const uint scale_groups = K / 64;
-    float gate_sum = 0.0f;
-    float up_sum = 0.0f;
-
-    for (uint col = tid; col < K; col += threads) {
-        uint scale_index = row * scale_groups + col / 64;
-        float x_value = x[col];
-
-        gate_sum += float(gate_scales[scale_index]) *
-                    float(gate_weights[row * K + col]) * x_value;
-        up_sum += float(up_scales[scale_index]) *
-                  float(up_weights[row * K + col]) * x_value;
-    }
-
-    gate_sum = simd_sum(gate_sum);
-    up_sum = simd_sum(up_sum);
-
-    if ((tid & 31u) == 0) {
-        uint warp = tid / 32;
-        partial[warp * 2] = gate_sum;
-        partial[warp * 2 + 1] = up_sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float gate_total = 0.0f;
-        float up_total = 0.0f;
-        for (uint i = 0; i < threads / 32; i++) {
-            gate_total += partial[i * 2];
-            up_total += partial[i * 2 + 1];
-        }
-        gate_out[row] = gate_total;
-        up_out[row] = up_total;
-    }
-}
-
-kernel void down_q8(device const char* weights [[buffer(0)]],
-                    device const half* scales [[buffer(1)]],
-                    device const float* x [[buffer(2)]],
-                    device float* y [[buffer(3)]],
-                    constant uint& K [[buffer(4)]],
-                    threadgroup float* partial [[threadgroup(0)]],
-                    uint row [[threadgroup_position_in_grid]],
-                    uint tid [[thread_position_in_threadgroup]],
-                    uint threads [[threads_per_threadgroup]]) {
-    const uint scale_groups = K / 64;
-    float sum = 0.0f;
-
-    for (uint col = tid; col < K; col += threads) {
-        float scale = float(scales[row * scale_groups + col / 64]);
-        sum += scale * float(weights[row * K + col]) * x[col];
-    }
-
-    sum = simd_sum(sum);
-    if ((tid & 31u) == 0) {
-        partial[tid / 32] = sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint i = 0; i < threads / 32; i++) {
-            total += partial[i];
-        }
-        y[row] = total;
-    }
-}
-
-kernel void rope_qk_inplace(device const half* q [[buffer(0)]],
-                            device half* k [[buffer(1)]],
-                            device float* q_rotated [[buffer(2)]],
-                            constant uint& pos [[buffer(3)]],
-                            uint id [[thread_position_in_grid]]) {
-    constexpr uint half_head_dim = 32;
-    constexpr uint num_q_heads = 14;
-    constexpr uint num_kv_heads = 2;
-
-    if (id >= (num_q_heads + num_kv_heads) * half_head_dim) {
-        return;
-    }
-
-    bool is_q = id < num_q_heads * half_head_dim;
-    uint local_id = is_q ? id : id - num_q_heads * half_head_dim;
-    uint head = local_id / half_head_dim;
-    uint dim = local_id % half_head_dim;
-    uint base = head * 64;
-
-    float angle = float(pos) * pow(1000000.0f, -float(2 * dim) / 64.0f);
-    float c = cos(angle);
-    float s = sin(angle);
-
-    float x0 = is_q ? float(q[base + dim]) : float(k[base + dim]);
-    float x1 = is_q ? float(q[base + dim + half_head_dim])
-                    : float(k[base + dim + half_head_dim]);
-
-    float y0 = x0 * c - x1 * s;
-    float y1 = x1 * c + x0 * s;
-
-    if (is_q) {
-        q_rotated[base + dim] = y0;
-        q_rotated[base + dim + half_head_dim] = y1;
-    } else {
-        k[base + dim] = half(y0);
-        k[base + dim + half_head_dim] = half(y1);
-    }
-}
-
-kernel void kv_cache_append(device const half* k [[buffer(0)]],
-                            device const half* v [[buffer(1)]],
-                            device half* k_cache [[buffer(2)]],
-                            device half* v_cache [[buffer(3)]],
-                            constant uint& pos [[buffer(4)]],
-                            uint id [[thread_position_in_grid]]) {
-    constexpr uint kv_dim = 128;
-
-    if (id < kv_dim) {
-        uint offset = pos * kv_dim + id;
-        k_cache[offset] = k[id];
-        v_cache[offset] = v[id];
-    }
-}
-
-kernel void gqa_attention_scores(device const float* q [[buffer(0)]],
-                                 device const half* k_cache [[buffer(1)]],
-                                 device float* scores [[buffer(2)]],
-                                 constant uint& n [[buffer(3)]],
-                                 uint3 group [[threadgroup_position_in_grid]],
-                                 uint3 local [[thread_position_in_threadgroup]]) {
-    constexpr uint num_heads = 14;
-    constexpr uint num_kv_heads = 2;
-    constexpr uint head_dim = 64;
-    constexpr uint kv_dim = num_kv_heads * head_dim;
-    constexpr float inv_sqrt_head_dim = 0.125f;
-
-    uint token = group.x;
-    uint head = group.y;
-    uint lane = local.x;
-
-    if (token >= n || head >= num_heads) {
-        return;
-    }
-
-    uint kv_head = head / (num_heads / num_kv_heads);
-    float sum = 0.0f;
-
-    for (uint dim = lane; dim < head_dim; dim += 32) {
-        sum += q[head * head_dim + dim] *
-               float(k_cache[token * kv_dim + kv_head * head_dim + dim]);
-    }
-
-    sum = simd_sum(sum);
-    if (lane == 0) {
-        scores[head * n + token] = sum * inv_sqrt_head_dim;
-    }
-}
-
-kernel void gqa_softmax(device float* scores [[buffer(0)]],
-                        constant uint& n [[buffer(1)]],
-                        threadgroup float* partial [[threadgroup(0)]],
-                        uint head [[threadgroup_position_in_grid]],
-                        uint tid [[thread_position_in_threadgroup]],
-                        uint threads [[threads_per_threadgroup]]) {
-    constexpr uint num_heads = 14;
-
-    if (head >= num_heads || n == 0) {
-        return;
-    }
-
-    uint base = head * n;
-
-    float local_max = -INFINITY;
-    for (uint token = tid; token < n; token += threads) {
-        local_max = max(local_max, scores[base + token]);
-    }
-
-    local_max = simd_max(local_max);
-    if ((tid & 31u) == 0) {
-        partial[tid / 32] = local_max;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float group_max = partial[0];
-        for (uint i = 1; i < threads / 32; i++) {
-            group_max = max(group_max, partial[i]);
-        }
-        partial[0] = group_max;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float max_score = partial[0];
-
-    float local_sum = 0.0f;
-    for (uint token = tid; token < n; token += threads) {
-        float value = exp(scores[base + token] - max_score);
-        scores[base + token] = value;
-        local_sum += value;
-    }
-
-    local_sum = simd_sum(local_sum);
-    if ((tid & 31u) == 0) {
-        partial[tid / 32] = local_sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float group_sum = 0.0f;
-        for (uint i = 0; i < threads / 32; i++) {
-            group_sum += partial[i];
-        }
-        partial[0] = 1.0f / group_sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-    float inv_sum = partial[0];
-
-    for (uint token = tid; token < n; token += threads) {
-        scores[base + token] *= inv_sum;
-    }
-}
-
-kernel void gqa_weighted_sum(device const float* scores [[buffer(0)]],
-                             device const half* v_cache [[buffer(1)]],
-                             device half* out [[buffer(2)]],
-                             constant uint& n [[buffer(3)]],
-                             uint2 gid [[thread_position_in_grid]]) {
-    constexpr uint num_heads = 14;
-    constexpr uint num_kv_heads = 2;
-    constexpr uint head_dim = 64;
-    constexpr uint kv_dim = num_kv_heads * head_dim;
-
-    uint dim = gid.x;
-    uint head = gid.y;
-
-    if (dim >= head_dim || head >= num_heads) {
-        return;
-    }
-
-    uint kv_head = head / (num_heads / num_kv_heads);
-    float sum = 0.0f;
-
-    for (uint token = 0; token < n; token++) {
-        sum += scores[head * n + token] *
-               float(v_cache[token * kv_dim + kv_head * head_dim + dim]);
-    }
-
-    out[head * head_dim + dim] = half(sum);
-}
-
-kernel void rms_norm_fast(device const half* x [[buffer(0)]],
-                          device const half* weight [[buffer(1)]],
-                          device half* y [[buffer(2)]],
-                          constant uint& D [[buffer(3)]],
-                          threadgroup float* partial [[threadgroup(0)]],
-                          uint tid [[thread_position_in_threadgroup]],
-                          uint threads [[threads_per_threadgroup]]) {
-    float sum = 0.0f;
-
-    for (uint i = tid; i < D; i += threads) {
-        float value = float(x[i]);
-        sum += value * value;
-    }
-
-    sum = simd_sum(sum);
-    if ((tid & 31u) == 0) {
-        partial[tid / 32] = sum;
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    if (tid == 0) {
-        float total = 0.0f;
-        for (uint i = 0; i < (threads + 31) / 32; i++) {
-            total += partial[i];
-        }
-        partial[0] = rsqrt(total / float(D) + 1e-6f);
-    }
-
-    threadgroup_barrier(mem_flags::mem_threadgroup);
-
-    float inv_rms = partial[0];
-    for (uint i = tid; i < D; i += threads) {
-        y[i] = half(float(x[i]) * float(weight[i]) * inv_rms);
-    }
-}
-
-kernel void silu_mul_float(device const float* gate [[buffer(0)]],
-                           device const float* up [[buffer(1)]],
-                           device float* out [[buffer(2)]],
-                           uint id [[thread_position_in_grid]]) {
-    float gate_value = gate[id];
-    out[id] = (gate_value / (1.0f + exp(-gate_value))) * up[id];
-}
-
-kernel void half_to_float(device const half* input [[buffer(0)]],
-                          device float* output [[buffer(1)]],
-                          uint id [[thread_position_in_grid]]) {
-    output[id] = float(input[id]);
-}
-
-kernel void residual_add_float(device half* x [[buffer(0)]],
-                               device const float* residual [[buffer(1)]],
-                               uint id [[thread_position_in_grid]]) {
-    x[id] = half(float(x[id]) + float(half(residual[id])));
-}
-    )METAL";
-    NSError* compileError = nil;
-    id<MTLLibrary> optimizedLibrary = [eng->device
-        newLibraryWithSource:[NSString stringWithUTF8String:optimizedMetalSource]
-        options:nil error:&compileError];
-    if (!optimizedLibrary) {
-        LOG(eng, "[qwen_engine] optimized Metal compile failed: " <<
-            [[compileError localizedDescription] UTF8String]);
-        delete eng; return nullptr;
-    }
-
-    id<MTLLibrary> sourceLibrary = nil;
-    if (backendUsesBatchedPrefill(backend)) {
-        std::ifstream sourceFile("kernels.metal");
-        std::string sourceText((std::istreambuf_iterator<char>(sourceFile)),
-                               std::istreambuf_iterator<char>());
-        if (sourceText.empty()) {
-            LOG(eng, "[qwen_engine] kernels.metal is required for batched prefill");
-            delete eng; return nullptr;
-        }
-        NSError* sourceError = nil;
-        sourceLibrary = [eng->device
-            newLibraryWithSource:[NSString stringWithUTF8String:sourceText.c_str()]
-            options:nil error:&sourceError];
-        if (!sourceLibrary) {
-            LOG(eng, "[qwen_engine] kernels.metal compile failed: " <<
-                [[sourceError localizedDescription] UTF8String]);
-            delete eng; return nullptr;
-        }
-    }
+    printPhase("metal_device_library");
 
     auto loadPipe = [&](NSString* name) -> id<MTLComputePipelineState> {
         return [eng->device newComputePipelineStateWithFunction:[library newFunctionWithName:name] error:nil];
     };
     auto loadOptimizedPipe = [&](NSString* name) -> id<MTLComputePipelineState> {
-        return [eng->device newComputePipelineStateWithFunction:
-                [optimizedLibrary newFunctionWithName:name] error:nil];
+        return [eng->device newComputePipelineStateWithFunction:[library newFunctionWithName:name] error:nil];
     };
     auto loadSourcePipe = [&](NSString* name) -> id<MTLComputePipelineState> {
-        if (!sourceLibrary) return nil;
-        return [eng->device newComputePipelineStateWithFunction:
-                [sourceLibrary newFunctionWithName:name] error:nil];
+        return [eng->device newComputePipelineStateWithFunction:[library newFunctionWithName:name] error:nil];
     };
+    bool usesGpuDecode = backend != QWEN_BACKEND_MPS_FP16;
+    bool usesFp16Decode = backend == QWEN_BACKEND_METAL_FP16;
+    bool usesQ4Decode = backendUsesQ4Projections(backend);
+    bool usesQ8Decode = backendUsesQ8Projections(backend);
+    bool usesBatchedPrefill = backendUsesBatchedPrefill(backend);
+    bool usesFp16LmHead = backendUsesFp16LmHead(backend);
+
     eng->pipeRmsNorm = loadOptimizedPipe(@"rms_norm_fast");
     eng->pipeResAdd  = loadPipe(@"residual_add");
-    eng->pipeMatvec  = loadPipe(@"matvec_float4");
-    eng->pipeGateUp = loadPipe(@"matvec_gate_up_batched");
-    eng->pipeHalfToFloat = loadOptimizedPipe(@"half_to_float");
-    eng->pipeSiluMul = loadOptimizedPipe(@"silu_mul_float");
-    eng->pipeDown = loadPipe(@"matvec_down_batched");
-    eng->pipeResAddFloat = loadOptimizedPipe(@"residual_add_float");
-    eng->pipeMatvecQ4 = loadOptimizedPipe(@"matvec_q4");
-    eng->pipeGateUpQ4 = loadOptimizedPipe(@"gate_up_q4");
-    eng->pipeDownQ4 = loadOptimizedPipe(@"down_q4");
-    eng->pipeMatvecQ8 = loadOptimizedPipe(@"matvec_q8");
-    eng->pipeGateUpQ8 = loadOptimizedPipe(@"gate_up_q8");
-    eng->pipeDownQ8 = loadOptimizedPipe(@"down_q8");
-    eng->pipeSiluHalf = loadPipe(@"silu_inplace");
-    eng->pipeMulHalf = loadPipe(@"element_mul");
-    eng->pipeRopeQK = loadOptimizedPipe(@"rope_qk_inplace");
-    eng->pipeKVAppend = loadOptimizedPipe(@"kv_cache_append");
-    eng->pipeAttnScores = loadOptimizedPipe(@"gqa_attention_scores");
-    eng->pipeAttnSoftmax = loadOptimizedPipe(@"gqa_softmax");
-    eng->pipeAttnWeighted = loadOptimizedPipe(@"gqa_weighted_sum");
-    if (backendUsesBatchedPrefill(backend)) {
+    if (usesFp16Decode || backend == QWEN_BACKEND_MPS_FP16 || usesBatchedPrefill || usesFp16LmHead) {
+        eng->pipeMatvec = loadPipe(@"matvec_float4");
+    }
+    if (usesFp16Decode) {
+        eng->pipeQKVFp16 = loadOptimizedPipe(@"qkv_fp16");
+        eng->pipeGateUp = loadPipe(@"matvec_gate_up_batched");
+        eng->pipeDown = loadPipe(@"matvec_down_batched");
+    }
+    if (usesGpuDecode) {
+        eng->pipeHalfToFloat = loadOptimizedPipe(@"half_to_float");
+        eng->pipeSiluMul = loadOptimizedPipe(@"silu_mul_float");
+        eng->pipeResAddFloat = loadOptimizedPipe(@"residual_add_float");
+        eng->pipeRopeKVAppend = loadOptimizedPipe(@"rope_qkv_cache_append");
+        eng->pipeAttnFused = loadOptimizedPipe(@"gqa_attention_fused");
+        eng->pipeAttnBlock = loadOptimizedPipe(@"gqa_attention_block");
+        eng->pipeAttnBlockGQA = loadOptimizedPipe(@"gqa_attention_block_grouped");
+        eng->pipeAttnBlockReduce = loadOptimizedPipe(@"gqa_attention_block_reduce");
+        eng->pipeAttnScores = loadOptimizedPipe(@"gqa_attention_scores");
+        eng->pipeAttnSoftmax = loadOptimizedPipe(@"gqa_softmax");
+        eng->pipeAttnWeighted = loadOptimizedPipe(@"gqa_weighted_sum");
+        eng->pipeArgmaxStage1 = loadOptimizedPipe(@"argmax_stage1");
+        eng->pipeArgmaxStage2 = loadOptimizedPipe(@"argmax_stage2");
+    }
+    if (usesQ4Decode) {
+        eng->pipeMatvecQ4 = loadOptimizedPipe(@"matvec_q4");
+        eng->pipeGateUpQ4 = loadOptimizedPipe(@"gate_up_q4");
+        eng->pipeDownQ4 = loadOptimizedPipe(@"down_q4");
+    }
+    if (usesQ8Decode) {
+        eng->pipeMatvecQ8 = loadOptimizedPipe(@"matvec_q8");
+        eng->pipeGateUpQ8 = loadOptimizedPipe(@"gate_up_q8");
+        eng->pipeDownQ8 = loadOptimizedPipe(@"down_q8");
+    }
+    if (usesBatchedPrefill || backend == QWEN_BACKEND_MPS_FP16) {
+        eng->pipeSiluHalf = loadPipe(@"silu_inplace");
+        eng->pipeMulHalf = loadPipe(@"element_mul");
+    }
+    if (usesBatchedPrefill) {
         eng->pipeEmbeddingBatch = loadSourcePipe(@"embedding_batch");
         eng->pipeRmsBatch = loadSourcePipe(@"rms_norm_batch");
         eng->pipeBiasBatch = loadSourcePipe(@"bias_add_batch");
@@ -1523,28 +1483,87 @@ kernel void residual_add_float(device half* x [[buffer(0)]],
         eng->pipeCausalScores = loadSourcePipe(@"causal_scores_batch");
         eng->pipeCausalSoftmax = loadSourcePipe(@"causal_softmax_batch");
         eng->pipeCausalWeighted = loadSourcePipe(@"causal_weighted_batch");
+        eng->pipeSplitQKVBiasBatch = loadOptimizedPipe(@"split_qkv_bias_batch");
+        eng->pipeGateUpSiluBatch = loadOptimizedPipe(@"gate_up_silu_mul_batch");
+        eng->pipeTiledPrefill = loadOptimizedPipe(@"gqa_tiled_prefill");
+        eng->pipeRopeBatchOffset = loadSourcePipe(@"rope_qk_batch_offset");
+        eng->pipeKVBatchOffset = loadSourcePipe(@"kv_cache_batch_offset");
+        eng->pipeCausalScoresOffset = loadSourcePipe(@"causal_scores_batch_offset");
+        eng->pipeCausalSoftmaxOffset = loadSourcePipe(@"causal_softmax_batch_offset");
+        eng->pipeCausalWeightedOffset = loadSourcePipe(@"causal_weighted_batch_offset");
     }
-    if (!eng->pipeRmsNorm || !eng->pipeResAdd || !eng->pipeMatvec ||
-        !eng->pipeGateUp || !eng->pipeHalfToFloat || !eng->pipeSiluMul ||
-        !eng->pipeDown || !eng->pipeResAddFloat || !eng->pipeMatvecQ4 ||
-        !eng->pipeGateUpQ4 || !eng->pipeDownQ4 || !eng->pipeMatvecQ8 ||
-        !eng->pipeGateUpQ8 || !eng->pipeDownQ8 || !eng->pipeSiluHalf || !eng->pipeMulHalf ||
-        !eng->pipeRopeQK || !eng->pipeKVAppend || !eng->pipeAttnScores ||
-        !eng->pipeAttnSoftmax || !eng->pipeAttnWeighted) {
+    if (!eng->pipeRmsNorm || !eng->pipeResAdd) {
         LOG(eng, "[qwen_engine] failed to load one or more Metal pipelines");
         delete eng; return nullptr;
     }
-    if (backendUsesBatchedPrefill(backend) &&
+    if ((usesFp16Decode || backend == QWEN_BACKEND_MPS_FP16 || usesBatchedPrefill || usesFp16LmHead) && !eng->pipeMatvec) {
+        LOG(eng, "[qwen_engine] failed to load FP16 matvec pipeline");
+        delete eng; return nullptr;
+    }
+    if (usesFp16Decode && (!eng->pipeQKVFp16 || !eng->pipeGateUp || !eng->pipeDown)) {
+        LOG(eng, "[qwen_engine] failed to load FP16 decode pipelines");
+        delete eng; return nullptr;
+    }
+    if (usesGpuDecode &&
+        (!eng->pipeHalfToFloat || !eng->pipeSiluMul || !eng->pipeResAddFloat ||
+         !eng->pipeRopeKVAppend || !eng->pipeAttnFused ||
+         !eng->pipeAttnBlock || !eng->pipeAttnBlockGQA || !eng->pipeAttnBlockReduce ||
+         !eng->pipeAttnScores || !eng->pipeAttnSoftmax ||
+         !eng->pipeAttnWeighted || !eng->pipeArgmaxStage1 || !eng->pipeArgmaxStage2)) {
+        LOG(eng, "[qwen_engine] failed to load GPU decode pipelines");
+        delete eng; return nullptr;
+    }
+    if (usesQ4Decode && (!eng->pipeMatvecQ4 || !eng->pipeGateUpQ4 || !eng->pipeDownQ4)) {
+        LOG(eng, "[qwen_engine] failed to load Q4 decode pipelines");
+        delete eng; return nullptr;
+    }
+    if (usesQ8Decode && (!eng->pipeMatvecQ8 || !eng->pipeGateUpQ8 || !eng->pipeDownQ8)) {
+        LOG(eng, "[qwen_engine] failed to load Q8 decode pipelines");
+        delete eng; return nullptr;
+    }
+    if ((usesBatchedPrefill || backend == QWEN_BACKEND_MPS_FP16) &&
+        (!eng->pipeSiluHalf || !eng->pipeMulHalf)) {
+        LOG(eng, "[qwen_engine] failed to load half activation pipelines");
+        delete eng; return nullptr;
+    }
+    if (usesBatchedPrefill &&
         (!eng->pipeEmbeddingBatch || !eng->pipeRmsBatch || !eng->pipeBiasBatch ||
          !eng->pipeResidualBatch || !eng->pipeRopeBatch || !eng->pipeKVBatch ||
-         !eng->pipeCausalScores || !eng->pipeCausalSoftmax || !eng->pipeCausalWeighted)) {
+         !eng->pipeCausalScores || !eng->pipeCausalSoftmax || !eng->pipeCausalWeighted ||
+         !eng->pipeSplitQKVBiasBatch || !eng->pipeGateUpSiluBatch || !eng->pipeTiledPrefill ||
+         !eng->pipeRopeBatchOffset || !eng->pipeKVBatchOffset ||
+         !eng->pipeCausalScoresOffset || !eng->pipeCausalSoftmaxOffset ||
+         !eng->pipeCausalWeightedOffset)) {
         LOG(eng, "[qwen_engine] failed to load batched prefill pipelines");
         delete eng; return nullptr;
     }
+    printPhase("pipeline_creation");
 
     std::string dir = weights_dir;
+    PackedWeightStore packedWeights = openPackedWeights(dir);
+    if (packedWeights.ready && packedWeights.mapped) {
+        eng->mapped_weights_data = packedWeights.data;
+        eng->mapped_weights_size = packedWeights.size;
+        eng->mapped_weights_fd = packedWeights.fd;
+        packedWeights.fd = -1;
+    }
+    if (startupTiming) {
+        std::cerr << "[startup] packed_weights: "
+                  << (packedWeights.ready ? "yes" : "no") << std::endl;
+        std::cerr << "[startup] mmap_weights: "
+                  << (packedWeights.mapped ? "yes" : "no") << std::endl;
+    }
+    double weightReadMs = 0.0;
+    double matrixSetupMs = 0.0;
+    std::vector<std::string> loadedWeightFiles;
     auto loadW = [&](const std::string& fname, bool* ok) {
-        return loadHalfBuffer(eng->device, dir + "/" + fname + ".bin", ok);
+        auto started = Clock::now();
+        std::string filename = fname + ".bin";
+        id<MTLBuffer> buffer = loadWeightBuffer(eng->device, dir, filename, &packedWeights, ok);
+        if (buffer) loadedWeightFiles.push_back(filename);
+        auto finished = Clock::now();
+        weightReadMs += std::chrono::duration<double, std::milli>(finished - started).count();
+        return buffer;
     };
     auto loadProjection = [&](const std::string& name, bool* ok) {
         std::pair<id<MTLBuffer>, id<MTLBuffer>> result;
@@ -1561,16 +1580,20 @@ kernel void residual_add_float(device half* x [[buffer(0)]],
         return result;
     };
     auto makeMatrix = [&](id<MTLBuffer> buffer, int rows, int columns) -> MPSMatrix* {
+        auto started = Clock::now();
         MPSMatrixDescriptor* descriptor = [MPSMatrixDescriptor
             matrixDescriptorWithRows:(NSUInteger)rows columns:(NSUInteger)columns
             rowBytes:(NSUInteger)columns * sizeof(uint16_t) dataType:MPSDataTypeFloat16];
-        return [[MPSMatrix alloc] initWithBuffer:buffer descriptor:descriptor];
+        MPSMatrix* matrix = [[MPSMatrix alloc] initWithBuffer:buffer descriptor:descriptor];
+        auto finished = Clock::now();
+        matrixSetupMs += std::chrono::duration<double, std::milli>(finished - started).count();
+        return matrix;
     };
 
     bool ok = true;
     eng->embed      = loadW("embed_tokens.weight", &ok);
     eng->final_norm = loadW("norm.weight", &ok);
-    if (backend == QWEN_BACKEND_INT4_FP16_LM_HEAD) {
+    if (backendUsesFp16LmHead(backend)) {
         eng->lm_head = loadW("lm_head.weight", &ok);
         eng->lm_head_scale = nil;
     } else {
@@ -1582,6 +1605,9 @@ kernel void residual_add_float(device half* x [[buffer(0)]],
     if (!ok) { delete eng; return nullptr; }
 
     eng->layers.resize(NUM_LAYERS);
+    bool combinedPrefillReady = useCombinedPrefill &&
+                                backendUsesBatchedPrefill(backend) &&
+                                packedWeights.ready;
     for (int i = 0; i < NUM_LAYERS; i++) {
         std::string p = "layer" + std::to_string(i);
         auto& lw = eng->layers[i];
@@ -1604,6 +1630,26 @@ kernel void residual_add_float(device half* x [[buffer(0)]],
         lw.gate=gate.first; lw.gate_scale=gate.second;
         lw.up=up.first; lw.up_scale=up.second;
         lw.down=down.first; lw.down_scale=down.second;
+        if (combinedPrefillReady) {
+            lw.qkv_combined = loadPackedWeightSpan(
+                eng->device,
+                &packedWeights,
+                {
+                    p + ".self_attn.q_proj.weight.bin",
+                    p + ".self_attn.k_proj.weight.bin",
+                    p + ".self_attn.v_proj.weight.bin",
+                });
+            lw.gate_up_combined = loadPackedWeightSpan(
+                eng->device,
+                &packedWeights,
+                {
+                    p + ".mlp.gate_proj.weight.bin",
+                    p + ".mlp.up_proj.weight.bin",
+                });
+            if (!lw.qkv_combined || !lw.gate_up_combined) {
+                combinedPrefillReady = false;
+            }
+        }
         if (backend == QWEN_BACKEND_HYBRID) {
             id<MTLBuffer> q16 = loadW(p + ".self_attn.q_proj.weight", &ok);
             id<MTLBuffer> k16 = loadW(p + ".self_attn.k_proj.weight", &ok);
@@ -1628,8 +1674,32 @@ kernel void residual_add_float(device half* x [[buffer(0)]],
             lw.up_matrix = makeMatrix(lw.up, INTERMEDIATE, HIDDEN_DIM);
             lw.down_matrix = makeMatrix(lw.down, HIDDEN_DIM, INTERMEDIATE);
         }
+        if (combinedPrefillReady) {
+            lw.qkv_matrix = makeMatrix(
+                lw.qkv_combined,
+                HIDDEN_DIM + 2 * NUM_KV_HEADS * HEAD_DIM,
+                HIDDEN_DIM);
+            lw.gate_up_matrix = makeMatrix(
+                lw.gate_up_combined,
+                2 * INTERMEDIATE,
+                HIDDEN_DIM);
+        }
         if (!ok) { delete eng; return nullptr; }
         LOG(eng, "[qwen_engine] layer " << i << " loaded");
+    }
+    eng->use_combined_prefill = combinedPrefillReady;
+    if (startupTiming) {
+        std::cerr << "[startup] weight_read_detail: " << weightReadMs << " ms" << std::endl;
+        std::cerr << "[startup] matrix_setup_detail: " << matrixSetupMs << " ms" << std::endl;
+    }
+    printPhase("weight_loading_and_matrix_setup");
+
+    if (warmupWeights) {
+        double warmupMs = prefetchPackedWeights(&packedWeights, loadedWeightFiles);
+        if (startupTiming) {
+            std::cerr << "[startup] weight_warmup_detail: " << warmupMs << " ms" << std::endl;
+        }
+        printPhase("weight_warmup");
     }
 
     uint hd = HIDDEN_DIM;
@@ -1650,6 +1720,14 @@ kernel void residual_add_float(device half* x [[buffer(0)]],
     eng->mlp_buf     = allocHalf(HIDDEN_DIM);
     eng->final_hidden = allocHalf(HIDDEN_DIM);
     eng->logits_buf  = allocHalf(VOCAB_SIZE);
+    constexpr uint argmaxThreads = 256;
+    constexpr uint argmaxBlocks = (VOCAB_SIZE + argmaxThreads - 1) / argmaxThreads;
+    eng->argmax_values_buf = [eng->device newBufferWithLength:argmaxBlocks * sizeof(float)
+                                                      options:MTLResourceStorageModeShared];
+    eng->argmax_ids_buf = [eng->device newBufferWithLength:argmaxBlocks * sizeof(uint)
+                                                   options:MTLResourceStorageModeShared];
+    eng->selected_token_buf = [eng->device newBufferWithLength:sizeof(uint)
+                                                       options:MTLResourceStorageModeShared];
 
     auto allocFloat = [&](int n) {
         return [eng->device newBufferWithLength:n * sizeof(float) options:MTLResourceStorageModeShared];
@@ -1673,6 +1751,10 @@ kernel void residual_add_float(device half* x [[buffer(0)]],
             eng->v_cache_gpu[layer] = allocHalf(MAX_SEQ_LEN * NUM_KV_HEADS * HEAD_DIM);
         }
         eng->attention_scores = allocFloat(NUM_HEADS * MAX_SEQ_LEN);
+        eng->attention_block_maxima = allocFloat(NUM_HEADS * MAX_ATTENTION_BLOCKS);
+        eng->attention_block_sums = allocFloat(NUM_HEADS * MAX_ATTENTION_BLOCKS);
+        eng->attention_block_outputs = allocFloat(
+            NUM_HEADS * MAX_ATTENTION_BLOCKS * HEAD_DIM);
         eng->q_rotated = allocFloat(NUM_HEADS * HEAD_DIM);
     }
 
@@ -1715,11 +1797,18 @@ kernel void residual_add_float(device half* x [[buffer(0)]],
             delete eng; return nullptr;
         }
     }
+    printPhase("runtime_buffer_setup");
+    if (startupTiming) {
+        auto now = Clock::now();
+        double ms = std::chrono::duration<double, std::milli>(now - startupStarted).count();
+        std::cerr << "[startup] total: " << ms << " ms" << std::endl;
+    }
 
     LOG(eng, "[qwen_engine] ready (backend=" <<
         (backend == QWEN_BACKEND_METAL_INT4 ? "int4" :
          backend == QWEN_BACKEND_INT4_FP16_LM_HEAD ? "mixed" :
          backend == QWEN_BACKEND_METAL_INT8 ? "int8" :
+         backend == QWEN_BACKEND_INT8_FP16_LM_HEAD ? "int8-fp16" :
          backend == QWEN_BACKEND_MPS_FP16 ? "mps" :
          backend == QWEN_BACKEND_HYBRID ? "hybrid" : "fp16") << ")");
     return eng;
@@ -1775,9 +1864,14 @@ int qwen_session_generate_streaming_sampled_until(QwenEngine* engine,
         (int)engine->session_tokens.size());
 
     int next_token = 0;
-    for (int i = 0; i < new_prompt_len; i++) {
-        SamplerState* step_sampler = (i == new_prompt_len - 1) ? &sampler : nullptr;
-        next_token = forward_step_gpu(engine, new_prompt_tokens[i], engine->session_pos++, step_sampler);
+    if (backendUsesBatchedPrefill(engine->backend) && new_prompt_len > 1) {
+        next_token = prefill_batch_fp16(engine, new_prompt_tokens, new_prompt_len, engine->session_pos, &sampler);
+        engine->session_pos += new_prompt_len;
+    } else {
+        for (int i = 0; i < new_prompt_len; i++) {
+            SamplerState* step_sampler = (i == new_prompt_len - 1) ? &sampler : nullptr;
+            next_token = forward_step_gpu(engine, new_prompt_tokens[i], engine->session_pos++, step_sampler);
+        }
     }
 
     int generated = 0;
@@ -1809,7 +1903,7 @@ int qwen_generate_streaming_sampled_until(QwenEngine* engine,
     if ((engine->backend == QWEN_BACKEND_METAL_FP16 ||
          engine->backend == QWEN_BACKEND_HYBRID) && prompt_len > 1) {
         auto started = std::chrono::high_resolution_clock::now();
-        int nextToken = prefill_batch_fp16(engine, prompt_tokens, prompt_len, &sampler);
+        int nextToken = prefill_batch_fp16(engine, prompt_tokens, prompt_len, 0, &sampler);
         auto prefillFinished = std::chrono::high_resolution_clock::now();
         double prefillMs = std::chrono::duration<double, std::milli>(prefillFinished - started).count();
         if (callback) callback(nextToken, user_data);

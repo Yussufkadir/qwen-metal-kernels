@@ -311,6 +311,90 @@ kernel void causal_weighted_batch(device const float* scores [[buffer(0)]],devic
     out[query*896+head*64+d]=half(sum);
 }
 
+kernel void rope_qk_batch_offset(device const half* q [[buffer(0)]],device half* k [[buffer(1)]],
+                                 device float* q_rotated [[buffer(2)]],constant uint& tokens [[buffer(3)]],
+                                 constant uint& start_pos [[buffer(4)]],uint id [[thread_position_in_grid]])
+{
+    constexpr uint pairs_per_token=16*32;
+    if(id>=tokens*pairs_per_token)return;
+    uint token=id/pairs_per_token,z=id%pairs_per_token;
+    bool iq=z<14*32;
+    uint local=iq?z:z-14*32,head=local/32,i=local%32,base=token*(iq?896:128)+head*64;
+    float position=float(start_pos+token);
+    float angle=position*pow(1000000.0f,-float(2*i)/64.0f),c=cos(angle),s=sin(angle);
+    float a=iq?float(q[base+i]):float(k[base+i]),b=iq?float(q[base+i+32]):float(k[base+i+32]);
+    if(iq){q_rotated[token*896+head*64+i]=a*c-b*s;q_rotated[token*896+head*64+i+32]=b*c+a*s;}
+    else{k[base+i]=half(a*c-b*s);k[base+i+32]=half(b*c+a*s);}
+}
+
+kernel void kv_cache_batch_offset(device const half* k [[buffer(0)]],device const half* v [[buffer(1)]],
+                                  device half* kc [[buffer(2)]],device half* vc [[buffer(3)]],
+                                  constant uint& tokens [[buffer(4)]],constant uint& start_pos [[buffer(5)]],
+                                  uint id [[thread_position_in_grid]])
+{
+    if(id>=tokens*128)return;
+    uint token=id/128,dim=id%128,cache_offset=(start_pos+token)*128+dim;
+    kc[cache_offset]=k[id];
+    vc[cache_offset]=v[id];
+}
+
+kernel void causal_scores_batch_offset(device const float* q [[buffer(0)]],device const half* kc [[buffer(1)]],
+                                       device float* scores [[buffer(2)]],constant uint& tokens [[buffer(3)]],
+                                       constant uint& total_tokens [[buffer(4)]],constant uint& start_pos [[buffer(5)]],
+                                       uint3 gid [[thread_position_in_grid]])
+{
+    uint key=gid.x,head=gid.y,query=gid.z;
+    if(query>=tokens||head>=14||key>start_pos+query||key>=total_tokens)return;
+    uint kh=head/7;
+    float sum=0;
+    for(uint d=0;d<64;d++)sum+=q[query*896+head*64+d]*float(kc[key*128+kh*64+d]);
+    scores[(query*14+head)*total_tokens+key]=sum*0.125f;
+}
+
+kernel void causal_softmax_batch_offset(device float* scores [[buffer(0)]],
+                                        constant uint& tokens [[buffer(1)]],
+                                        constant uint& total_tokens [[buffer(2)]],
+                                        constant uint& start_pos [[buffer(3)]],
+                                        threadgroup float* p [[threadgroup(0)]],
+                                        uint2 group [[threadgroup_position_in_grid]],
+                                        uint2 local [[thread_position_in_threadgroup]],
+                                        uint2 size [[threads_per_threadgroup]])
+{
+    uint head=group.x,query=group.y,tid=local.x,nt=size.x,n=start_pos+query+1;
+    if(head>=14||query>=tokens||n==0)return;
+    uint base=(query*14+head)*total_tokens;
+    float m=-INFINITY;
+    for(uint t=tid;t<n;t+=nt)m=max(m,scores[base+t]);
+    m=simd_max(m);
+    if((tid&31u)==0)p[tid/32]=m;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid==0){float z=p[0];for(uint i=1;i<nt/32;i++)z=max(z,p[i]);p[0]=z;}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    m=p[0];
+    float sum=0;
+    for(uint t=tid;t<n;t+=nt){float e=exp(scores[base+t]-m);scores[base+t]=e;sum+=e;}
+    sum=simd_sum(sum);
+    if((tid&31u)==0)p[tid/32]=sum;
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    if(tid==0){float z=0;for(uint i=0;i<nt/32;i++)z+=p[i];p[0]=1.0f/z;}
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+    float inv=p[0];
+    for(uint t=tid;t<n;t+=nt)scores[base+t]*=inv;
+}
+
+kernel void causal_weighted_batch_offset(device const float* scores [[buffer(0)]],device const half* vc [[buffer(1)]],
+                                         device half* out [[buffer(2)]],constant uint& tokens [[buffer(3)]],
+                                         constant uint& total_tokens [[buffer(4)]],constant uint& start_pos [[buffer(5)]],
+                                         uint3 gid [[thread_position_in_grid]])
+{
+    uint d=gid.x,head=gid.y,query=gid.z;
+    if(d>=64||head>=14||query>=tokens)return;
+    uint kh=head/7,n=start_pos+query+1,base=(query*14+head)*total_tokens;
+    float sum=0;
+    for(uint t=0;t<n;t++)sum+=scores[base+t]*float(vc[t*128+kh*64+d]);
+    out[query*896+head*64+d]=half(sum);
+}
+
 kernel void matvec_gate_up_batched(
     device const half*  gate_weights [[ buffer(0) ]],
     device const half*  up_weights   [[ buffer(1) ]],

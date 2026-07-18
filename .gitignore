@@ -34,6 +34,10 @@ metal_trace.trace/
 # Local benchmark result dumps
 benchmark_*.json
 
+# Local chat UX artifacts
+.qwen_chat_history
+chat_*.json
+
 INFERENCE_BACKENDS.md
 
 default.metallib

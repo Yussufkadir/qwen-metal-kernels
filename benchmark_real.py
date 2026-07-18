@@ -182,7 +182,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--contexts", default="32,128,512,1024", help="comma-separated prompt lengths")
     parser.add_argument("--tokens", type=int, default=100, help="generated tokens per measurement")
     parser.add_argument("--repeats", type=int, default=3)
-    parser.add_argument("--backends", default="mlx,fp16,int4", help="subset of mlx,fp16,int4,int8,mixed,mps,hybrid")
+    parser.add_argument("--backends", default="mlx,fp16,int4", help="subset of mlx,fp16,int4,int8,int8-fp16,mixed,mps,hybrid")
     parser.add_argument("--json", type=Path, help="optional raw measurement output")
     return parser.parse_args()
 
@@ -191,7 +191,7 @@ def main() -> None:
     args = parse_args()
     contexts = [int(value) for value in args.contexts.split(",")]
     engines = [value.strip() for value in args.backends.split(",")]
-    invalid = set(engines) - {"mlx", "fp16", "int4", "int8", "mixed", "mps", "hybrid"}
+    invalid = set(engines) - {"mlx", "fp16", "int4", "int8", "int8-fp16", "mixed", "mps", "hybrid"}
     if invalid:
         raise SystemExit(f"Unknown backends: {', '.join(sorted(invalid))}")
     if args.tokens < 2:

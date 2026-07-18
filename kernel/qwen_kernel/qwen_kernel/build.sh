@@ -4,8 +4,11 @@ set -e
 cd "$(dirname "$0")"
 
 echo "=== Compiling Metal kernels ==="
-xcrun -sdk macosx metal -c kernels.metal -o kernels.air
-xcrun -sdk macosx metallib kernels.air -o default.metallib
+metal_bin="$(xcrun --find metal)"
+metallib_bin="$(xcrun --find metallib)"
+"${metal_bin}" -c kernels.metal -o kernels.air
+"${metal_bin}" -c optimized_kernels.metal -o optimized_kernels.air
+"${metallib_bin}" kernels.air optimized_kernels.air -o default.metallib
 echo "Created default.metallib"
 
 echo "=== Compiling C bridge ==="

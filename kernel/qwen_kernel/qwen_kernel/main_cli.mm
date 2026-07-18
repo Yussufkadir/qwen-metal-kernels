@@ -2,6 +2,7 @@
 #include <vector>
 #include <string>
 #include <sstream>
+#include <cstdlib>
 
 #include "qwen_engine.h"
 
@@ -14,6 +15,12 @@ int main(int argc, char* argv[]) {
     bool quiet = false;
     bool stream_tokens = false;
     bool server_mode = false;
+    bool startup_timing = false;
+    bool warmup_weights = false;
+    bool gpu_warmup = false;
+    bool legacy_attention = false;
+    bool legacy_prefill = false;
+    bool legacy_prefill_attention = false;
 
     for (int i = 1; i < argc; i++) {
         std::string arg = argv[i];
@@ -21,7 +28,7 @@ int main(int argc, char* argv[]) {
             std::cout
                 << "Usage: ./inference_engine [options] token_id ...\n\n"
                 << "Options:\n"
-                << "  --backend fp16|int4|int8|mixed|mps|hybrid\n"
+                << "  --backend fp16|int4|int8|int8-fp16|mixed|mps|hybrid\n"
                 << "  --max-tokens N, -n N\n"
                 << "  --stop-token ID     Stop generation after producing this token (repeatable)\n"
                 << "  --temperature T     0 means greedy, >0 enables sampling\n"
@@ -31,6 +38,12 @@ int main(int argc, char* argv[]) {
                 << "  --seed S            0 uses a time-based seed\n"
                 << "  --stream-tokens     Print TOKEN <id> as each token is generated\n"
                 << "  --server            Keep engine loaded and read GENERATE requests from stdin\n"
+                << "  --startup-timing    Print native engine startup phase timings\n"
+                << "  --warmup            Touch loaded mmap weights during startup\n"
+                << "  --gpu-warmup        Run a 32-token prefill before accepting requests\n"
+                << "  --legacy-attention  Use separate score, softmax, and value kernels\n"
+                << "  --legacy-prefill    Use separate Q/K/V and gate/up prefill matrices\n"
+                << "  --legacy-prefill-attention  Disable SIMD-matrix tiled prefill attention\n"
                 << "  --quiet             Suppress headers and engine timing/log output\n";
             return 0;
         } else if (arg == "--max-tokens" || arg == "-n") {
@@ -62,18 +75,19 @@ int main(int argc, char* argv[]) {
             stop_tokens.push_back(std::stoi(argv[++i]));
         } else if (arg == "--backend") {
             if (i + 1 >= argc) {
-                std::cerr << "Missing value after --backend (fp16, int4, int8, mixed, mps, or hybrid)\n";
+                std::cerr << "Missing value after --backend (fp16, int4, int8, int8-fp16, mixed, mps, or hybrid)\n";
                 return 1;
             }
             std::string value = argv[++i];
             if (value == "fp16") backend = QWEN_BACKEND_METAL_FP16;
             else if (value == "int4") backend = QWEN_BACKEND_METAL_INT4;
             else if (value == "int8") backend = QWEN_BACKEND_METAL_INT8;
+            else if (value == "int8-fp16") backend = QWEN_BACKEND_INT8_FP16_LM_HEAD;
             else if (value == "mixed") backend = QWEN_BACKEND_INT4_FP16_LM_HEAD;
             else if (value == "mps") backend = QWEN_BACKEND_MPS_FP16;
             else if (value == "hybrid") backend = QWEN_BACKEND_HYBRID;
             else {
-                std::cerr << "Unknown backend: " << value << " (expected fp16, int4, int8, mixed, mps, or hybrid)\n";
+                std::cerr << "Unknown backend: " << value << " (expected fp16, int4, int8, int8-fp16, mixed, mps, or hybrid)\n";
                 return 1;
             }
         } else if (arg == "--quiet") {
@@ -82,6 +96,18 @@ int main(int argc, char* argv[]) {
             stream_tokens = true;
         } else if (arg == "--server") {
             server_mode = true;
+        } else if (arg == "--startup-timing") {
+            startup_timing = true;
+        } else if (arg == "--warmup") {
+            warmup_weights = true;
+        } else if (arg == "--gpu-warmup") {
+            gpu_warmup = true;
+        } else if (arg == "--legacy-attention") {
+            legacy_attention = true;
+        } else if (arg == "--legacy-prefill") {
+            legacy_prefill = true;
+        } else if (arg == "--legacy-prefill-attention") {
+            legacy_prefill_attention = true;
         } else {
             input_ids.push_back(std::stoi(arg));
         }
@@ -90,6 +116,7 @@ int main(int argc, char* argv[]) {
 
     const char* backendName = backend == QWEN_BACKEND_METAL_INT4 ? "int4" :
                               backend == QWEN_BACKEND_METAL_INT8 ? "int8" :
+                              backend == QWEN_BACKEND_INT8_FP16_LM_HEAD ? "int8-fp16" :
                               backend == QWEN_BACKEND_INT4_FP16_LM_HEAD ? "mixed" :
                               backend == QWEN_BACKEND_MPS_FP16 ? "mps" :
                               backend == QWEN_BACKEND_HYBRID ? "hybrid" : "fp16";
@@ -101,10 +128,47 @@ int main(int argc, char* argv[]) {
         std::cout << "backend: " << backendName << std::endl;
     }
 
+    if (startup_timing) {
+        setenv("QWEN_STARTUP_TIMING", "1", 1);
+    }
+    if (warmup_weights) {
+        setenv("QWEN_WARMUP_WEIGHTS", "1", 1);
+    }
+    if (legacy_attention) {
+        setenv("QWEN_FUSED_ATTENTION", "0", 1);
+    }
+    if (legacy_prefill) {
+        setenv("QWEN_COMBINED_PREFILL", "0", 1);
+    }
+    if (legacy_prefill_attention) {
+        setenv("QWEN_TILED_PREFILL", "0", 1);
+    }
     QwenEngine* engine = qwen_engine_create_with_backend("qwen_weights", backend, /*verbose=*/!quiet && !server_mode);
     if (!engine) {
         std::cerr << "Failed to initialize engine\n";
         return 1;
+    }
+
+    if (gpu_warmup) {
+        std::vector<int> warmup_prompt(32, 0);
+        auto discard_token = [](int, void*) {};
+        QwenSamplingParams warmup_sampling{0.0f, 0, 1.0f, 1.0f, 1};
+        int warmed = qwen_session_generate_streaming_sampled_until(
+            engine,
+            warmup_prompt.data(),
+            (int)warmup_prompt.size(),
+            1,
+            nullptr,
+            0,
+            warmup_sampling,
+            discard_token,
+            nullptr);
+        qwen_session_reset(engine);
+        if (warmed < 0) {
+            std::cerr << "GPU warmup failed\n";
+            qwen_engine_destroy(engine);
+            return 1;
+        }
     }
 
     if (server_mode) {
