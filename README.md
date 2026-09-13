@@ -1,6 +1,6 @@
 # Qwen Metal Local Inference Runtime
 
-Custom local Qwen inference runtime for Apple Silicon, written around Objective-C++ and Metal kernels. The project started as a kernel benchmark and grew into a usable terminal LLM runtime with KV cache reuse, persistent chat, startup optimization, benchmark tooling, and experimental quantized backends.
+Custom local Qwen inference runtime for Apple Silicon, written around Objective-C++ and Metal kernels. Project started as an optimization attempt of an qwen2.5-0.5b-instruct model but grew into more complex and detailed project with a usable terminal LLM runtime with KV cache reuse, persistent chat, startup optimization, benchmark tooling, and experimental quantized backends.
 
 The stable path is currently `fp16`. Quantized backends are kept for experimentation and measurement, but `fp16` is the recommended backend for normal local chat quality.
 
@@ -8,10 +8,10 @@ The stable path is currently `fp16`. Quantized backends are kept for experimenta
 
 - Native Qwen2.5-0.5B-Instruct inference engine on Apple Silicon
 - Terminal one-shot generation and interactive chat wrapper
-- Persistent server mode for low-latency multi-turn chat
+- Persistent server mode for low latency multi turn chat
 - KV cache reuse across chat turns
-- Metal kernels for projection, attention, RMS norm, RoPE, MLP, sampling support paths, and fused hot-path operations
-- Packed + mmap-backed weight loading for much faster startup
+- Metal kernels for projection, attention, RMS norm, RoPE, MLP, sampling support paths, and fused hot path operations
+- Packed + mmap backed weight loading for much faster startup
 - Verification and benchmark scripts for comparing correctness, latency, cache behavior, and MLX reference behavior
 - FP16 stable backend plus experimental `int8`, `int8-fp16`, `int4`, `mixed`, `mps`, and `hybrid` backends
 
@@ -70,15 +70,15 @@ Useful chat commands:
 
 ## Stable local LLM path
 
-The intended daily-use path is:
+The intended daily use path is:
 
 ```bash
 ./qwen-local --chat --backend fp16
 ```
 
-In chat mode the wrapper keeps the native engine loaded by default. That avoids paying engine startup on every turn and lets the runtime reuse the KV cache when the conversation grows normally. The persistent runtime also performs a 32-token GPU prefill warmup before reporting that it is ready. This moves MPS pipeline initialization out of the first user turn.
+In chat mode the wrapper keeps the native engine loaded by default. That avoids paying engine startup on every turn and lets the runtime reuse the KV cache when the conversation grows normally. The persistent runtime also performs a 32 token GPU prefill warmup before reporting that it is ready. This moves MPS pipeline initialization out of the first user turn.
 
-To measure the un-warmed first request:
+To measure the unwarmed first request:
 
 ```bash
 ./qwen-local --chat --no-gpu-warmup --stats
@@ -96,13 +96,13 @@ For a single prompt with timing:
 ./qwen-local --stats -n 128 "Explain KV cache in three bullet points."
 ```
 
-Optional warm-start mode:
+Optional warm start mode:
 
 ```bash
 ./qwen-local --warmup --stats "Explain KV cache simply."
 ```
 
-`--warmup` pre-touches the mmap-backed weights during native startup. This intentionally moves some page-fault cost into startup. It can be useful when testing cold-start behavior, but it is not the default because on an already warm OS file cache it can make one-shot latency worse.
+`--warmup` pre touches the mmap backed weights during native startup. This intentionally moves some page fault cost into startup. It can be useful when testing cold start behavior, but it is not the default because on an already warm OS file cache it can make one-shot latency worse.
 
 Save a one-shot transcript:
 
@@ -131,7 +131,7 @@ kernel/qwen_kernel/qwen_kernel/qwen_weights/weights.pack
 kernel/qwen_kernel/qwen_kernel/qwen_weights/weights.index
 ```
 
-The engine memory-maps the pack file and creates Metal buffers from the mapped weight ranges when possible. This reduces cold engine startup substantially compared with opening hundreds of loose weight files.
+The engine memory maps the pack file and creates Metal buffers from the mapped weight ranges when possible. This reduces cold engine startup substantially compared with opening hundreds of loose weight files.
 
 ## Verification
 
@@ -194,9 +194,9 @@ This reports separate medians for:
 
 The suite also writes raw rows to an ignored `benchmark_*.json` file for later comparison or plotting.
 
-Persistent session measurements use GPU prefill warmup by default. Use `--no-session-gpu-warmup` to expose the raw first-use cost. Core and one-shot measurements are never GPU-warmed unless explicitly launched through the native `--gpu-warmup` option.
+Persistent session measurements use GPU prefill warmup by default. Use `--no-session-gpu-warmup` to expose the raw first use cost. Core and one-shot measurements are never GPU warmed unless explicitly launched through the native `--gpu-warmup` option.
 
-To compare the optimized decode-attention path with the original three-pass implementation:
+To compare the optimized decode attention path with the original three pass implementation:
 
 ```bash
 QWEN_FUSED_ATTENTION=0 venv/bin/python benchmark_suite.py \
@@ -209,7 +209,7 @@ QWEN_FUSED_ATTENTION=0 venv/bin/python benchmark_suite.py \
   --skip-session
 ```
 
-Long-context decode switches from independent query-head blocks to paired GQA blocks once attention reaches 14 blocks. To disable that adaptive path for an A/B run:
+Long-context decode switches from independent query head blocks to paired GQA blocks once attention reaches 14 blocks. To disable that adaptive path for an A/B run:
 
 ```bash
 QWEN_GROUPED_GQA=0 venv/bin/python benchmark_suite.py \
@@ -222,7 +222,7 @@ QWEN_GROUPED_GQA=0 venv/bin/python benchmark_suite.py \
   --skip-session
 ```
 
-Prefill attention switches to an 8-query by 32-key SIMD-matrix tiled kernel for prompt deltas of at least 512 tokens. Both QK scores and probability-by-value accumulation use 8-by-8 SIMD-group matrix operations, with online softmax between them. To compare it with the score-matrix three-pass path:
+Prefill attention switches to an 8 query by 32 key SIMD matrix tiled kernel for prompt deltas of at least 512 tokens. Both QK scores and probability by value accumulation use 8 by 8 SIMD group matrix operations, with online softmax between them. To compare it with the score matrix three pass path:
 
 ```bash
 QWEN_TILED_PREFILL=0 venv/bin/python benchmark_suite.py \
@@ -285,7 +285,7 @@ venv/bin/python quantization_eval.py \
   --tokens 64
 ```
 
-This measures generated-token prefix agreement against the FP16 backend. It is a quantization-health check: high agreement means the quantized backend is preserving FP16 behavior; low agreement means quantization is changing token choices early.
+This measures generated token prefix agreement against the FP16 backend. It is a quantization health check: high agreement means the quantized backend is preserving FP16 behavior; low agreement means quantization is changing token choices early.
 
 ## Backend notes
 
@@ -305,19 +305,19 @@ The main engineering wins so far:
 
 - KV cache reuse for decode and persistent chat
 - batched prompt delta prefill for cached sessions
-- zero-copy combined QKV and gate/up prefill matrices
+- zero copy combined QKV and gate/up prefill matrices
 - fused QKV split/bias and gate/up activation kernels
-- SIMD-group matrix QK and probability-by-value tiled prefill for prompt deltas of at least 512 tokens
+- SIMD group matrix QK and probability by value tiled prefill for prompt deltas of at least 512 tokens
 - fused FP16 QKV projection
-- fused RoPE plus KV cache append for single-token decode
-- context-adaptive fused and blockwise decode attention
-- paired grouped-query attention near the 4096-token cache limit
+- fused RoPE plus KV cache append for single token decode
+- context adaptive fused and blockwise decode attention
+- paired grouped query attention near the 4096 token cache limit
 - GPU greedy argmax path
-- backend-specific pipeline loading
+- backend specific pipeline loading
 - direct Metal buffer weight loading
-- packed + mmap-backed weights
-- fast local tokenizer path for terminal one-shot usage
-- persistent GPU prefill warmup for low first-turn latency
+- packed + mmap backed weights
+- fast local tokenizer path for terminal one shot usage
+- persistent GPU prefill warmup for low first turn latency
 - startup timing instrumentation
 - session latency verification
 
@@ -325,6 +325,6 @@ The main engineering wins so far:
 
 This is a custom learning/runtime project, not a replacement for mature engines like MLX or llama.cpp across every workload.
 
-The native FP16 path is in the same rough short-context decode-speed class as MLX on the tested small model, but mature frameworks still have advantages in generality, long-context behavior, quality-preserving quantization, model coverage, and production hardening.
+The native FP16 path is in the same rough short context decode speed class as MLX on the tested small model, but mature frameworks still have advantages in generality, long context behavior, quality preserving quantization, model coverage, and production hardening.
 
 The project is strongest as a systems portfolio piece because it exposes the inference stack directly: kernels, memory layout, dispatch overhead, KV cache behavior, startup cost, backend tradeoffs, and measurement discipline.
