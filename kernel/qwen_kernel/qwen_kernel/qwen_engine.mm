@@ -305,6 +305,13 @@ std::vector<float> attention_head(const std::vector<float>& q,
 } 
 struct QwenEngine {
     ~QwenEngine() {
+        if (gpu_timing && timing_steps > 0) {
+            std::cerr << "[gpu-timing] decode steps: " << timing_steps
+                      << "  wall/step: " << timing_wall_ms / timing_steps << " ms"
+                      << "  gpu/step: " << timing_gpu_ms / timing_steps << " ms"
+                      << "  cpu+sync overhead/step: "
+                      << (timing_wall_ms - timing_gpu_ms) / timing_steps << " ms" << std::endl;
+        }
         if (mapped_weights_data && mapped_weights_size > 0) {
             munmap(mapped_weights_data, mapped_weights_size);
         }
@@ -314,7 +321,12 @@ struct QwenEngine {
     }
 
     bool verbose = false;
+    bool gpu_timing = false;
+    double timing_wall_ms = 0.0;
+    double timing_gpu_ms = 0.0;
+    int timing_steps = 0;
     bool use_fused_attention = true;
+    bool use_flash_decode = true;
     bool use_grouped_gqa = true;
     bool use_combined_prefill = false;
     bool use_tiled_prefill = true;
@@ -349,6 +361,7 @@ struct QwenEngine {
     id<MTLComputePipelineState> pipeAttnBlock = nil;
     id<MTLComputePipelineState> pipeAttnBlockGQA = nil;
     id<MTLComputePipelineState> pipeAttnBlockReduce = nil;
+    id<MTLComputePipelineState> pipeAttnDecode = nil;
     id<MTLComputePipelineState> pipeAttnScores = nil;
     id<MTLComputePipelineState> pipeAttnSoftmax = nil;
     id<MTLComputePipelineState> pipeAttnWeighted = nil;
@@ -472,19 +485,24 @@ SamplerState makeSampler(const QwenSamplingParams& params,
     return state;
 }
 
-int selectGreedyTokenOnGpu(QwenEngine* eng) {
-    if (!eng->pipeArgmaxStage1 || !eng->pipeArgmaxStage2 ||
-        !eng->argmax_values_buf || !eng->argmax_ids_buf || !eng->selected_token_buf) {
-        return -1;
-    }
+bool canSelectGreedyOnGpu(QwenEngine* eng) {
+    return eng->pipeArgmaxStage1 && eng->pipeArgmaxStage2 &&
+           eng->argmax_values_buf && eng->argmax_ids_buf && eng->selected_token_buf;
+}
 
+bool wantsGreedyOnGpu(QwenEngine* eng, SamplerState* sampler) {
+    QwenSamplingParams params = sampler ? sampler->params : greedySamplingParams();
+    return canSelectGreedyOnGpu(eng) &&
+           !usesSampling(params) && !(params.repetition_penalty > 1.0f && sampler);
+}
+
+// Appends the two-stage argmax to an existing encoder so the forward pass and
+// token selection share one command buffer (one commit/wait per token).
+void encodeGreedyArgmax(QwenEngine* eng, id<MTLComputeCommandEncoder> encoder) {
     constexpr uint stage1Threads = 256;
     constexpr uint stage2Threads = 512;
     uint vocabSize = VOCAB_SIZE;
     uint blockCount = (vocabSize + stage1Threads - 1) / stage1Threads;
-
-    id<MTLCommandBuffer> command = [eng->queue commandBuffer];
-    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
 
     [encoder setComputePipelineState:eng->pipeArgmaxStage1];
     [encoder setBuffer:eng->logits_buf offset:0 atIndex:0];
@@ -505,13 +523,28 @@ int selectGreedyTokenOnGpu(QwenEngine* eng) {
     [encoder setThreadgroupMemoryLength:stage2Threads * sizeof(uint) atIndex:1];
     [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1)
          threadsPerThreadgroup:MTLSizeMake(stage2Threads, 1, 1)];
+}
 
-    [encoder endEncoding];
-    [command commit];
-    [command waitUntilCompleted];
+int readGreedyToken(QwenEngine* eng) {
+    return (int)((uint*)[eng->selected_token_buf contents])[0];
+}
 
-    uint* selected = (uint*)[eng->selected_token_buf contents];
-    return (int)selected[0];
+int selectGreedyTokenOnGpu(QwenEngine* eng) {
+    if (!canSelectGreedyOnGpu(eng)) return -1;
+    id<MTLCommandBuffer> command = [eng->queue commandBuffer];
+    id<MTLComputeCommandEncoder> encoder = [command computeCommandEncoder];
+    encodeGreedyArgmax(eng, encoder);
+    finishAndWait(command, encoder);
+    return readGreedyToken(eng);
+}
+
+void recordGpuTiming(QwenEngine* eng, id<MTLCommandBuffer> cmd,
+                     std::chrono::high_resolution_clock::time_point started) {
+    if (!eng->gpu_timing) return;
+    auto finished = std::chrono::high_resolution_clock::now();
+    eng->timing_wall_ms += std::chrono::duration<double, std::milli>(finished - started).count();
+    eng->timing_gpu_ms += (cmd.GPUEndTime - cmd.GPUStartTime) * 1000.0;
+    eng->timing_steps++;
 }
 
 int selectTokenFromLogits(QwenEngine* eng, SamplerState* sampler) {
@@ -663,6 +696,7 @@ void encodeMPS(id<MTLCommandBuffer> cmd, MPSMatrixVectorMultiplication* kernel,
 }
 
 int forward_step_gpu(QwenEngine* eng, int token_id, int current_pos, SamplerState* sampler) {
+    auto stepStarted = std::chrono::high_resolution_clock::now();
     memcpy([eng->hidden contents],
            (uint16_t*)[eng->embed contents] + token_id * HIDDEN_DIM,
            HIDDEN_DIM * sizeof(uint16_t));
@@ -702,7 +736,37 @@ int forward_step_gpu(QwenEngine* eng, int token_id, int current_pos, SamplerStat
         [enc dispatchThreads:MTLSizeMake((NUM_HEADS + NUM_KV_HEADS) * HEAD_DIM / 2, 1, 1)
              threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
 
-        if (eng->use_fused_attention && numTokens <= 2 * ATTENTION_BLOCK_SIZE) {
+        if (eng->use_flash_decode) {
+            uint attentionBlocks =
+                (numTokens + ATTENTION_BLOCK_SIZE - 1) / ATTENTION_BLOCK_SIZE;
+            uint blockSize = ATTENTION_BLOCK_SIZE;
+            [enc setComputePipelineState:eng->pipeAttnDecode];
+            [enc setBuffer:eng->q_rotated offset:0 atIndex:0];
+            [enc setBuffer:eng->k_cache_gpu[l] offset:0 atIndex:1];
+            [enc setBuffer:eng->v_cache_gpu[l] offset:0 atIndex:2];
+            [enc setBuffer:eng->attn_buf offset:0 atIndex:3];
+            [enc setBuffer:eng->attention_block_maxima offset:0 atIndex:4];
+            [enc setBuffer:eng->attention_block_sums offset:0 atIndex:5];
+            [enc setBuffer:eng->attention_block_outputs offset:0 atIndex:6];
+            [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:7];
+            [enc setBytes:&attentionBlocks length:sizeof(attentionBlocks) atIndex:8];
+            [enc setBytes:&blockSize length:sizeof(blockSize) atIndex:9];
+            // 32 slot maxima + 32 slot sums + 32 slots x 64 dims of numerators
+            [enc setThreadgroupMemoryLength:(2 * 32 + 32 * HEAD_DIM) * sizeof(float)
+                                    atIndex:0];
+            [enc dispatchThreadgroups:MTLSizeMake(attentionBlocks, NUM_HEADS, 1)
+                 threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
+            if (attentionBlocks > 1) {
+                [enc setComputePipelineState:eng->pipeAttnBlockReduce];
+                [enc setBuffer:eng->attention_block_maxima offset:0 atIndex:0];
+                [enc setBuffer:eng->attention_block_sums offset:0 atIndex:1];
+                [enc setBuffer:eng->attention_block_outputs offset:0 atIndex:2];
+                [enc setBuffer:eng->attn_buf offset:0 atIndex:3];
+                [enc setBytes:&attentionBlocks length:sizeof(attentionBlocks) atIndex:4];
+                [enc dispatchThreadgroups:MTLSizeMake(NUM_HEADS, 1, 1)
+                     threadsPerThreadgroup:MTLSizeMake(HEAD_DIM, 1, 1)];
+            }
+        } else if (eng->use_fused_attention && numTokens <= 2 * ATTENTION_BLOCK_SIZE) {
             constexpr uint attentionThreads = 256;
             [enc setComputePipelineState:eng->pipeAttnFused];
             [enc setBuffer:eng->q_rotated offset:0 atIndex:0];
@@ -850,9 +914,12 @@ int forward_step_gpu(QwenEngine* eng, int token_id, int current_pos, SamplerStat
                   eng->final_hidden, eng->hidden_dim_const_buf);
     encodeProjection(eng, enc, eng->lm_head, eng->lm_head_scale,
                      eng->final_hidden, eng->logits_buf, VOCAB_SIZE, HIDDEN_DIM);
+    bool greedyOnGpu = wantsGreedyOnGpu(eng, sampler);
+    if (greedyOnGpu) encodeGreedyArgmax(eng, enc);
     finishAndWait(cmd, enc);
+    recordGpuTiming(eng, cmd, stepStarted);
 
-    return selectTokenFromLogits(eng, sampler);
+    return greedyOnGpu ? readGreedyToken(eng) : selectTokenFromLogits(eng, sampler);
 }
 
 int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, int start_pos, SamplerState* sampler) {
@@ -1409,12 +1476,42 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
     eng->use_fused_attention = useFusedAttention;
     eng->use_grouped_gqa = useGroupedGQA;
     eng->use_tiled_prefill = useTiledPrefill;
+    if (const char* value = std::getenv("QWEN_GPU_TIMING")) {
+        eng->gpu_timing = std::string(value) == "1";
+    }
+    if (const char* value = std::getenv("QWEN_FLASH_DECODE")) {
+        eng->use_flash_decode = std::string(value) != "0";
+    }
+    // QWEN_FUSED_ATTENTION=0 selects the three-pass reference path, so it
+    // also opts out of the flash-decode kernel.
+    if (!useFusedAttention) eng->use_flash_decode = false;
 
     eng->device = MTLCreateSystemDefaultDevice();
     if (!eng->device) { LOG(eng, "[qwen_engine] no Metal device found"); delete eng; return nullptr; }
     eng->queue = [eng->device newCommandQueue];
 
-    id<MTLLibrary> library = [eng->device newDefaultLibrary];
+    id<MTLLibrary> library = nil;
+    if (const char* sourceDir = std::getenv("QWEN_METAL_SOURCE_DIR")) {
+        // Dev path: compile the .metal sources at startup instead of loading
+        // default.metallib, so kernel edits need no offline Metal toolchain.
+        std::string source;
+        for (const char* file : {"kernels.metal", "optimized_kernels.metal"}) {
+            std::ifstream in(std::string(sourceDir) + "/" + file);
+            if (!in) { LOG(eng, "[qwen_engine] missing Metal source " << file); delete eng; return nullptr; }
+            source.append(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+            source += "\n";
+        }
+        NSError* error = nil;
+        library = [eng->device newLibraryWithSource:[NSString stringWithUTF8String:source.c_str()]
+                                            options:nil
+                                              error:&error];
+        if (!library) {
+            std::cerr << "[qwen_engine] Metal source compile failed: "
+                      << error.localizedDescription.UTF8String << std::endl;
+        }
+    } else {
+        library = [eng->device newDefaultLibrary];
+    }
     if (!library) { LOG(eng, "[qwen_engine] default.metallib not found"); delete eng; return nullptr; }
     printPhase("metal_device_library");
 
@@ -1453,6 +1550,15 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
         eng->pipeAttnBlock = loadOptimizedPipe(@"gqa_attention_block");
         eng->pipeAttnBlockGQA = loadOptimizedPipe(@"gqa_attention_block_grouped");
         eng->pipeAttnBlockReduce = loadOptimizedPipe(@"gqa_attention_block_reduce");
+        if (id<MTLFunction> decodeAttention = [library newFunctionWithName:@"gqa_decode_attention"]) {
+            eng->pipeAttnDecode = [eng->device newComputePipelineStateWithFunction:decodeAttention
+                                                                             error:nil];
+        }
+        if (!eng->pipeAttnDecode && eng->use_flash_decode) {
+            std::cerr << "[qwen_engine] gqa_decode_attention not in Metal library "
+                         "(rebuild default.metallib); using legacy decode attention" << std::endl;
+            eng->use_flash_decode = false;
+        }
         eng->pipeAttnScores = loadOptimizedPipe(@"gqa_attention_scores");
         eng->pipeAttnSoftmax = loadOptimizedPipe(@"gqa_softmax");
         eng->pipeAttnWeighted = loadOptimizedPipe(@"gqa_weighted_sum");

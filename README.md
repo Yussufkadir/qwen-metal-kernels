@@ -196,6 +196,19 @@ The suite also writes raw rows to an ignored `benchmark_*.json` file for later c
 
 Persistent session measurements use GPU prefill warmup by default. Use `--no-session-gpu-warmup` to expose the raw first use cost. Core and one-shot measurements are never GPU warmed unless explicitly launched through the native `--gpu-warmup` option.
 
+Single token decode attention uses `gqa_decode_attention`, a flash decoding kernel: each threadgroup scores 32 cached tokens at once with a per slot online softmax, and contexts over 256 tokens are split into blocks merged by `gqa_attention_block_reduce`. To A/B it against the previous fused/blockwise kernels:
+
+```bash
+QWEN_FLASH_DECODE=0 ./kernel/qwen_kernel/qwen_kernel/inference_engine --backend fp16 -n 128 <token ids...>
+```
+
+Developer switches for the native engine:
+
+- `QWEN_GPU_TIMING=1` prints per decode step wall time, GPU time, and the CPU + sync overhead between them.
+- `QWEN_METAL_SOURCE_DIR=<dir>` compiles `kernels.metal` and `optimized_kernels.metal` from `<dir>` at startup instead of loading `default.metallib`. Useful for kernel iteration, or when the offline Metal toolchain is not installed.
+
+Standalone kernel microbenchmarks live in `kernel/bench/`.
+
 To compare the optimized decode attention path with the original three pass implementation:
 
 ```bash
