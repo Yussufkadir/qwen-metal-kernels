@@ -1,14 +1,27 @@
+import shutil
 import numpy as np
 import mlx.core as mx
-import os
+from pathlib import Path
+from huggingface_hub import snapshot_download
 from mlx_lm import load
 
-model, tokenizer = load("Qwen/Qwen2.5-0.5B-Instruct")
-os.makedirs("qwen_weights", exist_ok=True)
+MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+WEIGHTS_DIR = Path(__file__).resolve().parent / "kernel/qwen_kernel/qwen_kernel/qwen_weights"
+TOKENIZER_DIR = WEIGHTS_DIR / "tokenizer"
+TOKENIZER_FILES = ("vocab.json", "merges.txt", "tokenizer_config.json")
+
+model, tokenizer = load(MODEL_NAME)
+WEIGHTS_DIR.mkdir(parents=True, exist_ok=True)
+
+snapshot = Path(snapshot_download(MODEL_NAME, allow_patterns=list(TOKENIZER_FILES)))
+TOKENIZER_DIR.mkdir(parents=True, exist_ok=True)
+for name in TOKENIZER_FILES:
+    shutil.copyfile(snapshot / name, TOKENIZER_DIR / name)
+print(f"Tokenizer exported to {TOKENIZER_DIR}")
 
 def save_tensor(name, tensor):
     arr = np.array(tensor.astype(mx.float16))
-    arr.tofile(f"qwen_weights/{name}.bin")
+    arr.tofile(WEIGHTS_DIR / f"{name}.bin")
 
 save_tensor("embed_tokens.weight", model.model.embed_tokens.weight)
 save_tensor("norm.weight", model.model.norm.weight)
@@ -35,4 +48,4 @@ for i, layer in enumerate(model.layers):
     save_tensor(f"layer{i}.mlp.down_proj.weight", layer.mlp.down_proj.weight)
     print(f"Layer {i} exported")
 
-print("Weights exported to qwen_weights/")
+print(f"Weights exported to {WEIGHTS_DIR}")

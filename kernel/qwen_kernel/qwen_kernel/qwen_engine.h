@@ -30,13 +30,11 @@ typedef struct QwenSamplingParams {
 
 QwenEngine* qwen_engine_create(const char* weights_dir, bool verbose);
 
-
 QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
                                              QwenBackend backend,
                                              bool verbose);
 
 void qwen_engine_destroy(QwenEngine* engine);
-
 
 int qwen_generate(QwenEngine* engine,
                    const int* prompt_tokens, int prompt_len,
@@ -44,7 +42,6 @@ int qwen_generate(QwenEngine* engine,
                    int* out_tokens);
 
 typedef void (*qwen_token_callback)(int token_id, void* user_data);
-
 
 int qwen_generate_streaming(QwenEngine* engine,
                              const int* prompt_tokens, int prompt_len,
@@ -78,6 +75,8 @@ int qwen_generate_sampled_until(QwenEngine* engine,
                                 int* out_tokens);
 
 void qwen_session_reset(QwenEngine* engine);
+
+int qwen_session_truncate(QwenEngine* engine, int position);
 
 int qwen_session_generate_streaming_sampled_until(QwenEngine* engine,
                                                   const int* new_prompt_tokens,

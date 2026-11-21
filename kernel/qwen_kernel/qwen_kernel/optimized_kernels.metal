@@ -554,15 +554,6 @@ kernel void gqa_attention_block_grouped(device const float* q [[buffer(0)]],
     }
 }
 
-// Single-token GQA decode attention, flash-decoding style.
-// Grid: (num_blocks, NUM_HEADS); 256 threads per threadgroup.
-// Each simdgroup is split into 4 "slots" of 8 lanes; a slot owns one key token
-// per iteration and each lane in it owns 8 of the 64 head dims. So one
-// threadgroup scores 32 tokens at once and keeps an online softmax per slot,
-// instead of looping over tokens serially.
-// num_blocks == 1: writes the normalized result to output.
-// num_blocks > 1 : writes (max, sum, unnormalized numerator) per block for
-//                  gqa_attention_block_reduce.
 kernel void gqa_decode_attention(device const float* q [[buffer(0)]],
                                  device const half* k_cache [[buffer(1)]],
                                  device const half* v_cache [[buffer(2)]],
@@ -620,7 +611,6 @@ kernel void gqa_decode_attention(device const float* q [[buffer(0)]],
         m = m_new;
     }
 
-    // scratch layout: [slots] maxima, [slots] sums, [slots * head_dim] numerators
     threadgroup float* slot_max = scratch;
     threadgroup float* slot_sum = scratch + slots;
     threadgroup float* slot_acc = scratch + 2 * slots;

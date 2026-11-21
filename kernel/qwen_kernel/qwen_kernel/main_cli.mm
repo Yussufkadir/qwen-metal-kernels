@@ -6,6 +6,40 @@
 
 #include "qwen_engine.h"
 
+namespace {
+
+constexpr int kMaxContextTokens = 4096;
+
+template <typename T, typename Parse>
+bool parseValue(const char* flag, const char* text, Parse parse, T* out) {
+    try {
+        size_t used = 0;
+        std::string value = text;
+        *out = parse(value, &used);
+        if (used == value.size()) return true;
+    } catch (const std::exception&) {
+    }
+    std::cerr << "Invalid value for " << flag << ": " << text << "\n";
+    return false;
+}
+
+bool parseInt(const char* flag, const char* text, int* out) {
+    return parseValue<int>(flag, text,
+        [](const std::string& v, size_t* used) { return std::stoi(v, used); }, out);
+}
+
+bool parseFloat(const char* flag, const char* text, float* out) {
+    return parseValue<float>(flag, text,
+        [](const std::string& v, size_t* used) { return std::stof(v, used); }, out);
+}
+
+bool parseSeed(const char* flag, const char* text, uint64_t* out) {
+    return parseValue<uint64_t>(flag, text,
+        [](const std::string& v, size_t* used) { return (uint64_t)std::stoull(v, used); }, out);
+}
+
+}
+
 int main(int argc, char* argv[]) {
     int max_new_tokens = 6;
     QwenBackend backend = QWEN_BACKEND_METAL_FP16;
@@ -51,28 +85,30 @@ int main(int argc, char* argv[]) {
                 std::cerr << "Missing value after " << arg << "\n";
                 return 1;
             }
-            max_new_tokens = std::stoi(argv[++i]);
+            if (!parseInt("--max-tokens", argv[++i], &max_new_tokens)) return 1;
         } else if (arg == "--temperature") {
             if (i + 1 >= argc) { std::cerr << "Missing value after --temperature\n"; return 1; }
-            sampling.temperature = std::stof(argv[++i]);
+            if (!parseFloat("--temperature", argv[++i], &sampling.temperature)) return 1;
         } else if (arg == "--top-k") {
             if (i + 1 >= argc) { std::cerr << "Missing value after --top-k\n"; return 1; }
-            sampling.top_k = std::stoi(argv[++i]);
+            if (!parseInt("--top-k", argv[++i], &sampling.top_k)) return 1;
         } else if (arg == "--top-p") {
             if (i + 1 >= argc) { std::cerr << "Missing value after --top-p\n"; return 1; }
-            sampling.top_p = std::stof(argv[++i]);
+            if (!parseFloat("--top-p", argv[++i], &sampling.top_p)) return 1;
         } else if (arg == "--repetition-penalty") {
             if (i + 1 >= argc) { std::cerr << "Missing value after --repetition-penalty\n"; return 1; }
-            sampling.repetition_penalty = std::stof(argv[++i]);
+            if (!parseFloat("--repetition-penalty", argv[++i], &sampling.repetition_penalty)) return 1;
         } else if (arg == "--seed") {
             if (i + 1 >= argc) { std::cerr << "Missing value after --seed\n"; return 1; }
-            sampling.seed = std::stoull(argv[++i]);
+            if (!parseSeed("--seed", argv[++i], &sampling.seed)) return 1;
         } else if (arg == "--stop-token") {
             if (i + 1 >= argc) {
                 std::cerr << "Missing value after --stop-token\n";
                 return 1;
             }
-            stop_tokens.push_back(std::stoi(argv[++i]));
+            int stop = 0;
+            if (!parseInt("--stop-token", argv[++i], &stop)) return 1;
+            stop_tokens.push_back(stop);
         } else if (arg == "--backend") {
             if (i + 1 >= argc) {
                 std::cerr << "Missing value after --backend (fp16, int4, int8, int8-fp16, mixed, mps, or hybrid)\n";
@@ -109,8 +145,22 @@ int main(int argc, char* argv[]) {
         } else if (arg == "--legacy-prefill-attention") {
             legacy_prefill_attention = true;
         } else {
-            input_ids.push_back(std::stoi(arg));
+            int token = 0;
+            try {
+                size_t used = 0;
+                token = std::stoi(arg, &used);
+                if (used != arg.size()) throw std::invalid_argument(arg);
+            } catch (const std::exception&) {
+                std::cerr << "Unknown option or invalid token id: " << arg
+                          << " (see --help)\n";
+                return 1;
+            }
+            input_ids.push_back(token);
         }
+    }
+    if (max_new_tokens <= 0) {
+        std::cerr << "--max-tokens must be positive\n";
+        return 1;
     }
     if (input_ids.empty() && !server_mode) input_ids = {1053};
 
@@ -143,7 +193,7 @@ int main(int argc, char* argv[]) {
     if (legacy_prefill_attention) {
         setenv("QWEN_TILED_PREFILL", "0", 1);
     }
-    QwenEngine* engine = qwen_engine_create_with_backend("qwen_weights", backend, /*verbose=*/!quiet && !server_mode);
+    QwenEngine* engine = qwen_engine_create_with_backend("qwen_weights", backend, !quiet && !server_mode);
     if (!engine) {
         std::cerr << "Failed to initialize engine\n";
         return 1;
@@ -153,16 +203,13 @@ int main(int argc, char* argv[]) {
         std::vector<int> warmup_prompt(32, 0);
         auto discard_token = [](int, void*) {};
         QwenSamplingParams warmup_sampling{0.0f, 0, 1.0f, 1.0f, 1};
-        int warmed = qwen_session_generate_streaming_sampled_until(
-            engine,
-            warmup_prompt.data(),
-            (int)warmup_prompt.size(),
-            1,
-            nullptr,
-            0,
-            warmup_sampling,
-            discard_token,
-            nullptr);
+        int warmed = backend == QWEN_BACKEND_MPS_FP16
+            ? qwen_generate_streaming_sampled_until(
+                engine, warmup_prompt.data(), (int)warmup_prompt.size(), 1,
+                nullptr, 0, warmup_sampling, discard_token, nullptr)
+            : qwen_session_generate_streaming_sampled_until(
+                engine, warmup_prompt.data(), (int)warmup_prompt.size(), 1,
+                nullptr, 0, warmup_sampling, discard_token, nullptr);
         qwen_session_reset(engine);
         if (warmed < 0) {
             std::cerr << "GPU warmup failed\n";
@@ -234,8 +281,21 @@ int main(int argc, char* argv[]) {
                 std::cout << "ERROR no prompt tokens" << std::endl;
                 continue;
             }
+            if ((long)request_tokens.size() + request_max_tokens - 1 > kMaxContextTokens) {
+                std::cout << "ERROR context window exceeded: " << request_tokens.size()
+                          << " prompt tokens + " << request_max_tokens
+                          << " new tokens is over the " << kMaxContextTokens
+                          << " token limit" << std::endl;
+                continue;
+            }
+            if (cached_request && backend == QWEN_BACKEND_MPS_FP16) {
+                cached_request = false;
+                std::cout << "BEGIN" << std::endl;
+                std::cout << "CACHE 0 " << request_tokens.size() << " 0" << std::endl;
+            } else {
+                std::cout << "BEGIN" << std::endl;
+            }
 
-            std::cout << "BEGIN" << std::endl;
             struct ServerCtx { int count; std::vector<int> tokens; } ctx{0, {}};
             auto callback = [](int token_id, void* user_data) {
                 auto* ctx = static_cast<ServerCtx*>(user_data);
@@ -252,15 +312,18 @@ int main(int argc, char* argv[]) {
                        cached_tokens[common] == request_tokens[common]) {
                     common++;
                 }
-                if (common < cached_tokens.size()) {
-                    qwen_session_reset(engine);
-                    cached_tokens.clear();
-                    common = 0;
-                    cache_reset = true;
-                }
                 if (common >= request_tokens.size()) {
-                    std::cout << "ERROR no new prompt tokens for cached generation" << std::endl;
-                    continue;
+                    common = request_tokens.size() - 1;
+                }
+                if (common < cached_tokens.size()) {
+                    if (common > 0 && qwen_session_truncate(engine, (int)common) == (int)common) {
+                        cached_tokens.resize(common);
+                    } else {
+                        qwen_session_reset(engine);
+                        cached_tokens.clear();
+                        common = 0;
+                        cache_reset = true;
+                    }
                 }
                 std::vector<int> delta(request_tokens.begin() + (long)common, request_tokens.end());
                 std::cout << "CACHE " << common << " " << delta.size() << " "
@@ -277,6 +340,9 @@ int main(int argc, char* argv[]) {
                     if (ctx.tokens.size() > 1) {
                         cached_tokens.insert(cached_tokens.end(), ctx.tokens.begin(), ctx.tokens.end() - 1);
                     }
+                } else {
+                    qwen_session_reset(engine);
+                    cached_tokens.clear();
                 }
             } else {
                 n = qwen_generate_streaming_sampled_until(

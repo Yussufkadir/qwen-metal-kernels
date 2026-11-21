@@ -1,5 +1,3 @@
-// Per-op decode profile with cold weights: each op is dispatched 24x (one per
-// layer) on 24 distinct weight copies, like the real forward pass.
 #import <Foundation/Foundation.h>
 #import <Metal/Metal.h>
 #include <vector>

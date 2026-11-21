@@ -688,9 +688,9 @@ kernel void softmax_inplace(
     }
 }
 kernel void attention_weighted_sum(
-    device const float* scores  [[ buffer(0) ]],  // [num_tokens]
-    device const half*  v       [[ buffer(1) ]],  // [num_tokens, head_dim]
-    device half*        out     [[ buffer(2) ]],  // [head_dim]
+    device const float* scores  [[ buffer(0) ]],
+    device const half*  v       [[ buffer(1) ]],
+    device half*        out     [[ buffer(2) ]],
     constant uint& num_tokens   [[ buffer(3) ]],
     constant uint& head_dim     [[ buffer(4) ]],
     uint d [[ thread_position_in_grid ]])

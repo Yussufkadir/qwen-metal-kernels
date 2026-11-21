@@ -439,6 +439,18 @@ struct QwenEngine {
 namespace {
 
 #define LOG(engine, msg) do { if ((engine)->verbose) std::cout << msg << std::endl; } while (0)
+#define ERR(msg) do { std::cerr << msg << std::endl; } while (0)
+
+bool tokensInVocab(const int* tokens, int count) {
+    for (int i = 0; i < count; i++) {
+        if (tokens[i] < 0 || tokens[i] >= VOCAB_SIZE) {
+            ERR("[qwen_engine] token id " << tokens[i] << " is outside the vocabulary (0.."
+                << VOCAB_SIZE - 1 << ")");
+            return false;
+        }
+    }
+    return true;
+}
 
 bool backendUsesQ4Projections(QwenBackend backend) {
     return backend == QWEN_BACKEND_METAL_INT4 ||
@@ -496,8 +508,6 @@ bool wantsGreedyOnGpu(QwenEngine* eng, SamplerState* sampler) {
            !usesSampling(params) && !(params.repetition_penalty > 1.0f && sampler);
 }
 
-// Appends the two-stage argmax to an existing encoder so the forward pass and
-// token selection share one command buffer (one commit/wait per token).
 void encodeGreedyArgmax(QwenEngine* eng, id<MTLComputeCommandEncoder> encoder) {
     constexpr uint stage1Threads = 256;
     constexpr uint stage2Threads = 512;
@@ -751,7 +761,6 @@ int forward_step_gpu(QwenEngine* eng, int token_id, int current_pos, SamplerStat
             [enc setBytes:&numTokens length:sizeof(numTokens) atIndex:7];
             [enc setBytes:&attentionBlocks length:sizeof(attentionBlocks) atIndex:8];
             [enc setBytes:&blockSize length:sizeof(blockSize) atIndex:9];
-            // 32 slot maxima + 32 slot sums + 32 slots x 64 dims of numerators
             [enc setThreadgroupMemoryLength:(2 * 32 + 32 * HEAD_DIM) * sizeof(float)
                                     atIndex:0];
             [enc dispatchThreadgroups:MTLSizeMake(attentionBlocks, NUM_HEADS, 1)
@@ -1190,8 +1199,8 @@ int prefill_batch_fp16(QwenEngine* eng, const int* token_ids, int token_count, i
     [encoder setBuffer:eng->hidden_dim_const_buf offset:0 atIndex:3];
     [encoder setThreadgroupMemoryLength:8 * sizeof(float) atIndex:0];
     [encoder dispatchThreadgroups:MTLSizeMake(1, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
-    encodeMatvec(encoder, eng->pipeMatvec, eng->lm_head, eng->final_hidden,
-                 eng->logits_buf, VOCAB_SIZE, HIDDEN_DIM);
+    encodeProjection(eng, encoder, eng->lm_head, eng->lm_head_scale,
+                     eng->final_hidden, eng->logits_buf, VOCAB_SIZE, HIDDEN_DIM);
     finishAndWait(command, encoder);
 
     return selectTokenFromLogits(eng, sampler);
@@ -1302,7 +1311,6 @@ int forward_step(QwenEngine* eng,
                 memcpy(&ptr[i], &h2, sizeof(h2));
             }
         }
-
 
         id<MTLCommandBuffer> postAttnCmd = [queue commandBuffer];
         if (eng->backend == QWEN_BACKEND_MPS_FP16) {
@@ -1482,22 +1490,18 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
     if (const char* value = std::getenv("QWEN_FLASH_DECODE")) {
         eng->use_flash_decode = std::string(value) != "0";
     }
-    // QWEN_FUSED_ATTENTION=0 selects the three-pass reference path, so it
-    // also opts out of the flash-decode kernel.
     if (!useFusedAttention) eng->use_flash_decode = false;
 
     eng->device = MTLCreateSystemDefaultDevice();
-    if (!eng->device) { LOG(eng, "[qwen_engine] no Metal device found"); delete eng; return nullptr; }
+    if (!eng->device) { ERR("[qwen_engine] no Metal device found"); delete eng; return nullptr; }
     eng->queue = [eng->device newCommandQueue];
 
     id<MTLLibrary> library = nil;
     if (const char* sourceDir = std::getenv("QWEN_METAL_SOURCE_DIR")) {
-        // Dev path: compile the .metal sources at startup instead of loading
-        // default.metallib, so kernel edits need no offline Metal toolchain.
         std::string source;
         for (const char* file : {"kernels.metal", "optimized_kernels.metal"}) {
             std::ifstream in(std::string(sourceDir) + "/" + file);
-            if (!in) { LOG(eng, "[qwen_engine] missing Metal source " << file); delete eng; return nullptr; }
+            if (!in) { ERR("[qwen_engine] missing Metal source " << file); delete eng; return nullptr; }
             source.append(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
             source += "\n";
         }
@@ -1512,7 +1516,7 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
     } else {
         library = [eng->device newDefaultLibrary];
     }
-    if (!library) { LOG(eng, "[qwen_engine] default.metallib not found"); delete eng; return nullptr; }
+    if (!library) { ERR("[qwen_engine] default.metallib not found"); delete eng; return nullptr; }
     printPhase("metal_device_library");
 
     auto loadPipe = [&](NSString* name) -> id<MTLComputePipelineState> {
@@ -1599,15 +1603,15 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
         eng->pipeCausalWeightedOffset = loadSourcePipe(@"causal_weighted_batch_offset");
     }
     if (!eng->pipeRmsNorm || !eng->pipeResAdd) {
-        LOG(eng, "[qwen_engine] failed to load one or more Metal pipelines");
+        ERR("[qwen_engine] failed to load one or more Metal pipelines");
         delete eng; return nullptr;
     }
     if ((usesFp16Decode || backend == QWEN_BACKEND_MPS_FP16 || usesBatchedPrefill || usesFp16LmHead) && !eng->pipeMatvec) {
-        LOG(eng, "[qwen_engine] failed to load FP16 matvec pipeline");
+        ERR("[qwen_engine] failed to load FP16 matvec pipeline");
         delete eng; return nullptr;
     }
     if (usesFp16Decode && (!eng->pipeQKVFp16 || !eng->pipeGateUp || !eng->pipeDown)) {
-        LOG(eng, "[qwen_engine] failed to load FP16 decode pipelines");
+        ERR("[qwen_engine] failed to load FP16 decode pipelines");
         delete eng; return nullptr;
     }
     if (usesGpuDecode &&
@@ -1616,20 +1620,20 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
          !eng->pipeAttnBlock || !eng->pipeAttnBlockGQA || !eng->pipeAttnBlockReduce ||
          !eng->pipeAttnScores || !eng->pipeAttnSoftmax ||
          !eng->pipeAttnWeighted || !eng->pipeArgmaxStage1 || !eng->pipeArgmaxStage2)) {
-        LOG(eng, "[qwen_engine] failed to load GPU decode pipelines");
+        ERR("[qwen_engine] failed to load GPU decode pipelines");
         delete eng; return nullptr;
     }
     if (usesQ4Decode && (!eng->pipeMatvecQ4 || !eng->pipeGateUpQ4 || !eng->pipeDownQ4)) {
-        LOG(eng, "[qwen_engine] failed to load Q4 decode pipelines");
+        ERR("[qwen_engine] failed to load Q4 decode pipelines");
         delete eng; return nullptr;
     }
     if (usesQ8Decode && (!eng->pipeMatvecQ8 || !eng->pipeGateUpQ8 || !eng->pipeDownQ8)) {
-        LOG(eng, "[qwen_engine] failed to load Q8 decode pipelines");
+        ERR("[qwen_engine] failed to load Q8 decode pipelines");
         delete eng; return nullptr;
     }
     if ((usesBatchedPrefill || backend == QWEN_BACKEND_MPS_FP16) &&
         (!eng->pipeSiluHalf || !eng->pipeMulHalf)) {
-        LOG(eng, "[qwen_engine] failed to load half activation pipelines");
+        ERR("[qwen_engine] failed to load half activation pipelines");
         delete eng; return nullptr;
     }
     if (usesBatchedPrefill &&
@@ -1640,7 +1644,7 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
          !eng->pipeRopeBatchOffset || !eng->pipeKVBatchOffset ||
          !eng->pipeCausalScoresOffset || !eng->pipeCausalSoftmaxOffset ||
          !eng->pipeCausalWeightedOffset)) {
-        LOG(eng, "[qwen_engine] failed to load batched prefill pipelines");
+        ERR("[qwen_engine] failed to load batched prefill pipelines");
         delete eng; return nullptr;
     }
     printPhase("pipeline_creation");
@@ -1899,7 +1903,7 @@ QwenEngine* qwen_engine_create_with_backend(const char* weights_dir,
         eng->mpsHVocab = [[MPSMatrixVectorMultiplication alloc]
             initWithDevice:eng->device rows:VOCAB_SIZE columns:HIDDEN_DIM];
         if (!eng->mpsHH || !eng->mpsHKV || !eng->mpsHI || !eng->mpsIH || !eng->mpsHVocab) {
-            LOG(eng, "[qwen_engine] failed to initialize MPS GEMV kernels");
+            ERR("[qwen_engine] failed to initialize MPS GEMV kernels");
             delete eng; return nullptr;
         }
     }
@@ -1934,6 +1938,15 @@ void qwen_session_reset(QwenEngine* engine) {
     engine->session_tokens.clear();
 }
 
+int qwen_session_truncate(QwenEngine* engine, int position) {
+    if (!engine || position < 0 || position > engine->session_pos) return -1;
+    engine->session_pos = position;
+    if ((int)engine->session_tokens.size() > position) {
+        engine->session_tokens.resize((size_t)position);
+    }
+    return position;
+}
+
 static bool qwen_is_stop_token(int token, const int* stop_tokens, int stop_count) {
     if (!stop_tokens || stop_count <= 0) return false;
     for (int i = 0; i < stop_count; i++) {
@@ -1953,11 +1966,12 @@ int qwen_session_generate_streaming_sampled_until(QwenEngine* engine,
                                                   void* user_data) {
     if (!engine || !new_prompt_tokens || new_prompt_len <= 0 || max_new_tokens <= 0) return -1;
     if (engine->backend == QWEN_BACKEND_MPS_FP16) {
-        LOG(engine, "[qwen_engine] session cache is not supported for MPS backend");
+        ERR("[qwen_engine] session cache is not supported for MPS backend");
         return -1;
     }
+    if (!tokensInVocab(new_prompt_tokens, new_prompt_len)) return -1;
     if (engine->session_pos + new_prompt_len + max_new_tokens - 1 > MAX_SEQ_LEN) {
-        LOG(engine, "[qwen_engine] session exceeds GPU KV-cache capacity of " << MAX_SEQ_LEN);
+        ERR("[qwen_engine] session exceeds GPU KV-cache capacity of " << MAX_SEQ_LEN);
         return -1;
     }
 
@@ -2000,8 +2014,9 @@ int qwen_generate_streaming_sampled_until(QwenEngine* engine,
                                           QwenSamplingParams sampling,
                                           qwen_token_callback callback, void* user_data) {
     if (!engine || !prompt_tokens || prompt_len <= 0 || max_new_tokens <= 0) return -1;
+    if (!tokensInVocab(prompt_tokens, prompt_len)) return -1;
     if (prompt_len + max_new_tokens - 1 > MAX_SEQ_LEN) {
-        LOG(engine, "[qwen_engine] sequence exceeds GPU KV-cache capacity of " << MAX_SEQ_LEN);
+        ERR("[qwen_engine] sequence exceeds GPU KV-cache capacity of " << MAX_SEQ_LEN);
         return -1;
     }
     SamplerState sampler = makeSampler(sampling, prompt_tokens, prompt_len);
@@ -2050,9 +2065,10 @@ int qwen_generate_streaming_sampled_until(QwenEngine* engine,
             int token_id = (step < prompt_len) ? prompt_tokens[step] : generated_ids.back();
             int current_pos = seq_len++;
 
+            SamplerState* step_sampler = (step >= prompt_len - 1) ? &sampler : nullptr;
             int next_token = engine->backend == QWEN_BACKEND_MPS_FP16
-                ? forward_step(engine, token_id, current_pos, k_cache, v_cache, &sampler)
-                : forward_step_gpu(engine, token_id, current_pos, &sampler);
+                ? forward_step(engine, token_id, current_pos, k_cache, v_cache, step_sampler)
+                : forward_step_gpu(engine, token_id, current_pos, step_sampler);
             generated_ids.push_back(next_token);
 
             if (step == prompt_len - 1) {

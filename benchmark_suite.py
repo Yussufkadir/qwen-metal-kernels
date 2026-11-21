@@ -13,7 +13,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Iterable
 
-
 ROOT = Path(__file__).resolve().parent
 ENGINE_DIR = ROOT / "kernel/qwen_kernel/qwen_kernel"
 ENGINE = ENGINE_DIR / "inference_engine"
@@ -34,7 +33,6 @@ CHAT_TIMING_RE = re.compile(
     r"first_token=([0-9.]+|n/a)ms decode≈([0-9.]+) tok/s decode/print=([0-9.]+)ms"
 )
 CACHE_RE = re.compile(r"\[cache\] common=(\d+) delta=(\d+)( reset)?")
-
 
 @dataclass
 class BenchRow:
@@ -60,7 +58,6 @@ class BenchRow:
     packed_weights: bool | None = None
     mmap_weights: bool | None = None
     output_tokens: list[int] | None = None
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Reliable benchmark suite for the custom Qwen runtime.")
@@ -92,14 +89,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=240.0)
     return parser.parse_args()
 
-
 def normalize_token_ids(value) -> list[int]:
     if isinstance(value, dict) and "input_ids" in value:
         return [int(token) for token in value["input_ids"]]
     if hasattr(value, "input_ids"):
         return [int(token) for token in value.input_ids]
     return [int(token) for token in value]
-
 
 def load_tokenizer(model_name: str, allow_download: bool):
     from transformers import AutoTokenizer
@@ -110,13 +105,11 @@ def load_tokenizer(model_name: str, allow_download: bool):
         local_files_only=not allow_download,
     )
 
-
 def find_subsequence(sequence: list[int], needle: list[int]) -> int:
     for index in range(len(sequence) - len(needle) + 1):
         if sequence[index : index + len(needle)] == needle:
             return index
     raise ValueError("could not locate prompt marker inside chat template")
-
 
 def make_prompt_tokens(tokenizer, target_length: int) -> list[int]:
     marker = "ZXQMARKERZXQ"
@@ -148,7 +141,6 @@ def make_prompt_tokens(tokenizer, target_length: int) -> list[int]:
         raise RuntimeError(f"prompt length mismatch: wanted {target_length}, got {len(result)}")
     return result
 
-
 def run_command(
     command: list[str],
     *,
@@ -169,13 +161,11 @@ def run_command(
     )
     return result.returncode, result.stdout, (time.perf_counter() - started) * 1000.0
 
-
 def parse_generated(output: str) -> list[int]:
     match = GENERATED_RE.search(output)
     if not match:
         raise RuntimeError(f"could not parse generated tokens:\n{output}")
     return [int(token) for token in match.group(1).split()]
-
 
 def benchmark_native_core(
     engine: Path,
@@ -219,7 +209,6 @@ def benchmark_native_core(
         output_tokens=output_tokens,
     )
 
-
 def benchmark_startup(
     engine: Path,
     engine_dir: Path,
@@ -254,7 +243,6 @@ def benchmark_startup(
         packed_weights=flags.get("packed_weights"),
         mmap_weights=flags.get("mmap_weights"),
     )
-
 
 def benchmark_oneshot(
     qwen_local: Path,
@@ -297,7 +285,6 @@ def benchmark_oneshot(
         decode_tps=float(decode_tps),
         decode_print_ms=float(decode_print_ms),
     )
-
 
 def benchmark_session(
     qwen_local: Path,
@@ -367,7 +354,6 @@ def benchmark_session(
         )
     return rows
 
-
 def benchmark_mlx_core(mx, generate_step, model, prompt_tokens: list[int], max_tokens: int, repeat: int) -> BenchRow:
     output: list[int] = []
     generator = generate_step(mx.array(prompt_tokens), model, max_tokens=max_tokens)
@@ -398,13 +384,11 @@ def benchmark_mlx_core(mx, generate_step, model, prompt_tokens: list[int], max_t
         output_tokens=output,
     )
 
-
 def median(values: Iterable[float | None]) -> float | None:
     clean = [value for value in values if value is not None]
     if not clean:
         return None
     return statistics.median(clean)
-
 
 def print_core_summary(rows: list[BenchRow], contexts: list[int], backends: list[str]) -> None:
     core = [row for row in rows if row.kind in {"native_core", "mlx_core"}]
@@ -425,7 +409,6 @@ def print_core_summary(rows: list[BenchRow], contexts: list[int], backends: list
                 f"{median(row.prefill_tps for row in selected):11.1f}  "
                 f"{median(row.decode_tps for row in selected):10.1f}"
             )
-
 
 def print_runtime_summary(rows: list[BenchRow], backends: list[str]) -> None:
     startup = [row for row in rows if row.kind == "startup"]
@@ -476,11 +459,9 @@ def print_runtime_summary(rows: list[BenchRow], backends: list[str]) -> None:
                     f"{median(row.decode_tps for row in selected):10.1f}  {cache_text:>14}"
                 )
 
-
 def default_json_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return ROOT / f"benchmark_{stamp}.json"
-
 
 def main() -> int:
     args = parse_args()
@@ -588,7 +569,6 @@ def main() -> int:
     json_path.write_text(json.dumps([asdict(row) for row in rows], indent=2) + "\n")
     print(f"\nRaw results: {json_path}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

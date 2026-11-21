@@ -1,10 +1,3 @@
-//
-//  bridge.mm
-//  qwen_kernel
-//
-//  Created by Yusuf Surmen on 30/04/2026.
-//
-
 #import <Metal/Metal.h>
 #import <Foundation/Foundation.h>
 #include <stdint.h>

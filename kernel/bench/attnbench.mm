@@ -42,7 +42,6 @@ int main(int argc,char**argv){ @autoreleasepool{
     auto t=[&](bool useNew, id<MTLBuffer> out){ double best=1e9; for(int it=0;it<6;it++){ id<MTLCommandBuffer> cb=[q commandBuffer]; id<MTLComputeCommandEncoder> e=[cb computeCommandEncoder];
       for(int l=0;l<L;l++) enc(e,l,useNew,out); [e endEncoding]; [cb commit]; [cb waitUntilCompleted]; double x=(cb.GPUEndTime-cb.GPUStartTime)*1e3; if(it&&x<best)best=x;} return best; };
     double a=t(false,o1), b=t(true,o2);
-    // CPU reference for layer 23 head outputs
     double maxerr=0; __fp16* ko=(__fp16*)kc[L-1].contents; __fp16* vo=(__fp16*)vc[L-1].contents; __fp16* r2=(__fp16*)o2.contents; __fp16* r1=(__fp16*)o1.contents; double maxold=0;
     for(int h=0;h<NH;h++){ int kv=h/7; std::vector<double> s(nt); double mx=-1e30;
       for(uint tk=0;tk<nt;tk++){ double d=0; for(int i=0;i<HD;i++) d+=qp[h*HD+i]*(double)ko[tk*128+kv*64+i]; s[tk]=d*0.125; mx=fmax(mx,s[tk]); }

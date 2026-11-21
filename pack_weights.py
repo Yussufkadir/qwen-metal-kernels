@@ -4,14 +4,11 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-
 ALIGNMENT = 4096
-
 
 def align(offset: int, alignment: int = ALIGNMENT) -> int:
     remainder = offset % alignment
     return offset if remainder == 0 else offset + alignment - remainder
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -24,7 +21,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--index-name", default="weights.index")
     parser.add_argument("--profile", default="fp16", choices=["fp16", "all"])
     return parser.parse_args()
-
 
 def fp16_load_order() -> list[str]:
     names = [
@@ -52,7 +48,6 @@ def fp16_load_order() -> list[str]:
         )
     return names
 
-
 def ordered_files(weights_dir: Path, profile: str) -> list[Path]:
     files = {path.name: path for path in weights_dir.glob("*.bin") if path.is_file()}
     if profile == "all":
@@ -69,7 +64,6 @@ def ordered_files(weights_dir: Path, profile: str) -> list[Path]:
         if name not in used:
             result.append(files[name])
     return result
-
 
 def main() -> None:
     args = parse_args()
@@ -107,7 +101,6 @@ def main() -> None:
     print(f"Payload: {total_size / (1024 * 1024):.1f} MB")
     print(f"Archive: {pack_path}")
     print(f"Index:   {index_path}")
-
 
 if __name__ == "__main__":
     main()

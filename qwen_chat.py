@@ -5,6 +5,7 @@ import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -13,11 +14,19 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable
 
-
 ROOT = Path(__file__).resolve().parent
 ENGINE_DIR = ROOT / "kernel/qwen_kernel/qwen_kernel"
 ENGINE = ENGINE_DIR / "inference_engine"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
+MAX_CONTEXT_TOKENS = 4096
+CONTEXT_TRIM_TARGET = 0.5
+TOKENIZER_DIR = ENGINE_DIR / "qwen_weights/tokenizer"
+TOKENIZER_REQUIRED_FILES = ("vocab.json", "merges.txt")
+TOKENIZER_OPTIONAL_FILES = ("tokenizer_config.json",)
+QWEN_SPLIT_PATTERN = (
+    r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}| ?[^\s\p{L}\p{N}]+[\r\n]*"
+    r"|\s*[\r\n]+|\s+(?!\S)|\s+"
+)
 HISTORY_FILE = ROOT / ".qwen_chat_history"
 TOKEN_RE = re.compile(r"^TOKEN\s+(-?\d+)\s*$")
 GENERATED_RE = re.compile(r"Generated continuation:\s*([0-9 ]+)")
@@ -32,9 +41,8 @@ BACKEND_NOTES = {
     "hybrid": "experimental mixed execution path",
 }
 
-
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description=__doc__)
+    parser = argparse.ArgumentParser(description="Terminal chat and one-shot front end for the native Qwen Metal engine.")
     parser.add_argument("prompt", nargs="*", help="user prompt text")
     parser.add_argument("--backend", default="fp16", choices=VALID_BACKENDS)
     parser.add_argument("--max-tokens", "-n", type=int, default=128)
@@ -80,15 +88,12 @@ def parse_args() -> argparse.Namespace:
     )
     return parser.parse_args()
 
-
 def normalize_token_ids(value) -> list[int]:
-    """Handle tokenizer return shapes across Transformers versions."""
     if isinstance(value, dict) and "input_ids" in value:
         return [int(token) for token in value["input_ids"]]
     if hasattr(value, "input_ids"):
         return [int(token) for token in value.input_ids]
     return [int(token) for token in value]
-
 
 def find_hf_snapshot(model_name: str) -> Path | None:
     cache_home = os.environ.get("HF_HOME")
@@ -108,20 +113,25 @@ def find_hf_snapshot(model_name: str) -> Path | None:
         return None
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
-
 class FastQwenTokenizer:
     eos_token_id = 151645
 
     def __init__(self, snapshot: Path):
         from tokenizers import AddedToken, Tokenizer
         from tokenizers.decoders import ByteLevel as ByteLevelDecoder
+        from tokenizers import Regex
         from tokenizers.models import BPE
-        from tokenizers.pre_tokenizers import ByteLevel
+        from tokenizers.normalizers import NFC
+        from tokenizers.pre_tokenizers import ByteLevel, Sequence, Split
 
         self.snapshot = snapshot
         model = BPE.from_file(str(snapshot / "vocab.json"), str(snapshot / "merges.txt"), unk_token=None)
         self.tokenizer = Tokenizer(model)
-        self.tokenizer.pre_tokenizer = ByteLevel(add_prefix_space=False)
+        self.tokenizer.normalizer = NFC()
+        self.tokenizer.pre_tokenizer = Sequence([
+            Split(Regex(QWEN_SPLIT_PATTERN), behavior="isolated"),
+            ByteLevel(add_prefix_space=False, use_regex=False),
+        ])
         self.tokenizer.decoder = ByteLevelDecoder()
 
         config_path = snapshot / "tokenizer_config.json"
@@ -190,15 +200,34 @@ class FastQwenTokenizer:
         token_id = self.tokenizer.token_to_id(token)
         return int(token_id) if token_id is not None else -1
 
+def has_tokenizer_files(directory: Path) -> bool:
+    return all((directory / name).is_file() for name in TOKENIZER_REQUIRED_FILES)
 
-def load_fast_qwen_tokenizer(model_name: str) -> FastQwenTokenizer:
+def copy_tokenizer_files(source: Path, destination: Path) -> bool:
+    try:
+        destination.mkdir(parents=True, exist_ok=True)
+        for name in TOKENIZER_REQUIRED_FILES + TOKENIZER_OPTIONAL_FILES:
+            if (source / name).is_file():
+                shutil.copyfile(source / name, destination / name)
+    except OSError:
+        return False
+    return has_tokenizer_files(destination)
+
+def load_fast_qwen_tokenizer(model_name: str, tokenizer_dir: Path | None = None) -> FastQwenTokenizer:
     if model_name != MODEL_NAME:
         raise RuntimeError("fast tokenizer is only wired for the default Qwen model")
+    tokenizer_dir = TOKENIZER_DIR if tokenizer_dir is None else tokenizer_dir
+    if has_tokenizer_files(tokenizer_dir):
+        return FastQwenTokenizer(tokenizer_dir)
     snapshot = find_hf_snapshot(model_name)
     if snapshot is None:
-        raise RuntimeError(f"could not find local Hugging Face snapshot for {model_name}")
+        raise RuntimeError(
+            f"no tokenizer files in {tokenizer_dir} and no local Hugging Face snapshot for "
+            f"{model_name}; run export_weights.py once"
+        )
+    if copy_tokenizer_files(snapshot, tokenizer_dir):
+        return FastQwenTokenizer(tokenizer_dir)
     return FastQwenTokenizer(snapshot)
-
 
 def load_tokenizer(model_name: str, allow_download: bool, implementation: str):
     if implementation in {"auto", "fast"}:
@@ -229,7 +258,6 @@ def load_tokenizer(model_name: str, allow_download: bool, implementation: str):
             ) from exc
         raise
 
-
 @dataclass
 class Timing:
     prompt_ms: float = 0.0
@@ -242,7 +270,6 @@ class Timing:
     cache_delta: int | None = None
     cache_reset: bool = False
 
-
 @dataclass
 class GenerationResult:
     text: str
@@ -252,7 +279,6 @@ class GenerationResult:
     elapsed: float
     timing: Timing
 
-
 def make_chat_tokens(tokenizer, messages: list[dict[str, str]]) -> list[int]:
     templated = tokenizer.apply_chat_template(
         messages,
@@ -260,7 +286,6 @@ def make_chat_tokens(tokenizer, messages: list[dict[str, str]]) -> list[int]:
         add_generation_prompt=True,
     )
     return normalize_token_ids(templated)
-
 
 def make_prompt_tokens(tokenizer, system_prompt: str, user_prompt: str) -> list[int]:
     return make_chat_tokens(
@@ -270,7 +295,6 @@ def make_prompt_tokens(tokenizer, system_prompt: str, user_prompt: str) -> list[
             {"role": "user", "content": user_prompt},
         ],
     )
-
 
 def special_stop_ids(tokenizer) -> set[int]:
     stop_ids: set[int] = set()
@@ -288,17 +312,14 @@ def special_stop_ids(tokenizer) -> set[int]:
                 stop_ids.add(token_id)
     return stop_ids
 
-
 def decode(tokenizer, token_ids: Iterable[int], skip_special_tokens: bool = True) -> str:
     return tokenizer.decode(list(token_ids), skip_special_tokens=skip_special_tokens)
-
 
 def build_engine(engine_dir: Path) -> None:
     script = engine_dir / "build_engine.sh"
     if not script.exists():
         raise SystemExit(f"Build script not found: {script}")
     subprocess.run([str(script)], cwd=engine_dir, check=True)
-
 
 def setup_readline_history(enabled: bool) -> None:
     if not enabled or not sys.stdin.isatty():
@@ -315,7 +336,6 @@ def setup_readline_history(enabled: bool) -> None:
         atexit.register(readline.write_history_file, str(HISTORY_FILE))
     except Exception:
         pass
-
 
 def run_native_stream(
     engine: Path,
@@ -356,7 +376,6 @@ def run_native_stream(
         stderr=subprocess.STDOUT,
         bufsize=1,
     )
-
 
 def run_native_blocking(
     engine: Path,
@@ -403,7 +422,6 @@ def run_native_blocking(
         raise RuntimeError(f"Could not parse engine output:\n{result.stdout}")
     return [int(token) for token in match.group(1).split()], result.stdout
 
-
 class PersistentNativeEngine:
     def __init__(
         self,
@@ -434,25 +452,46 @@ class PersistentNativeEngine:
         )
         assert self.process.stdout is not None
         assert self.process.stdin is not None
-        ready = self.process.stdout.readline().strip()
-        if ready != f"READY {backend}":
-            self.close()
-            raise RuntimeError(f"native server failed to start, got: {ready!r}")
+        preamble: list[str] = []
+        while True:
+            line = self.process.stdout.readline()
+            if line == "":
+                self.close()
+                detail = "\n".join(preamble) or "no output"
+                raise RuntimeError(f"native server failed to start:\n{detail}")
+            line = line.strip()
+            if line == f"READY {backend}":
+                break
+            if line:
+                preamble.append(line)
         self.load_elapsed = time.perf_counter() - started
 
+    def is_alive(self) -> bool:
+        return self.process.poll() is None
+
     def close(self) -> None:
-        if self.process.poll() is not None:
-            return
-        try:
-            assert self.process.stdin is not None
-            self.process.stdin.write("QUIT\n")
-            self.process.stdin.flush()
-        except BrokenPipeError:
-            pass
-        try:
-            self.process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            self.process.terminate()
+        if self.process.poll() is None:
+            try:
+                assert self.process.stdin is not None
+                self.process.stdin.write("QUIT\n")
+                self.process.stdin.flush()
+            except OSError:
+                pass
+            try:
+                self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                self.process.terminate()
+                try:
+                    self.process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    self.process.kill()
+                    self.process.wait()
+        for stream in (self.process.stdin, self.process.stdout):
+            if stream is not None and not stream.closed:
+                try:
+                    stream.close()
+                except OSError:
+                    pass
 
     def reset_session(self) -> None:
         if self.process.poll() is not None:
@@ -540,7 +579,6 @@ class PersistentNativeEngine:
             if not saw_begin:
                 raise RuntimeError(f"unexpected native server output: {output}")
 
-
 def visible_prefix(tokens: list[int], stop_ids: set[int]) -> list[int]:
     result: list[int] = []
     for token in tokens:
@@ -548,7 +586,6 @@ def visible_prefix(tokens: list[int], stop_ids: set[int]) -> list[int]:
             break
         result.append(token)
     return result
-
 
 def generate_turn(
     *,
@@ -725,6 +762,46 @@ def generate_turn(
         timing=timing,
     )
 
+def fits_context(prompt_tokens: int, max_tokens: int) -> bool:
+    return prompt_tokens + max_tokens - 1 <= MAX_CONTEXT_TOKENS
+
+def prompt_budget(max_tokens: int) -> int:
+    return MAX_CONTEXT_TOKENS - max_tokens + 1
+
+def first_turn_index(messages: list[dict[str, str]]) -> int:
+    return 1 if messages and messages[0]["role"] == "system" else 0
+
+def trim_to_context(
+    tokenizer,
+    messages: list[dict[str, str]],
+    max_tokens: int,
+    target: float = CONTEXT_TRIM_TARGET,
+) -> list[dict[str, str]]:
+    budget = prompt_budget(max_tokens)
+    if len(make_chat_tokens(tokenizer, messages)) <= budget:
+        return []
+    goal = int(budget * target)
+    first = first_turn_index(messages)
+    removed: list[dict[str, str]] = []
+    while len(messages) - first > 1:
+        removed.append(messages.pop(first))
+        if len(messages) - first > 1 and messages[first]["role"] == "assistant":
+            removed.append(messages.pop(first))
+        if len(make_chat_tokens(tokenizer, messages)) <= goal:
+            break
+    return removed
+
+def full_transcript(messages: list[dict[str, str]], archived: list[dict[str, str]]) -> list[dict[str, str]]:
+    first = first_turn_index(messages)
+    return messages[:first] + archived + messages[first:]
+
+def print_context(tokenizer, messages: list[dict[str, str]], archived: list[dict[str, str]], max_tokens: int) -> None:
+    used = len(make_chat_tokens(tokenizer, messages))
+    budget = prompt_budget(max_tokens)
+    live = len(messages) - first_turn_index(messages)
+    print(f"context:     {used}/{MAX_CONTEXT_TOKENS} tokens ({100.0 * used / MAX_CONTEXT_TOKENS:.0f}%)")
+    print(f"reply room:  {max_tokens} tokens reserved, {max(budget - used, 0)} prompt tokens free")
+    print(f"messages:    {live} in context, {len(archived)} dropped from context (kept in transcript)")
 
 def print_chat_help() -> None:
     print(
@@ -733,6 +810,7 @@ def print_chat_help() -> None:
         "  /exit, /quit       leave chat\n"
         "  /status            show current backend, sampling, history, and cache mode\n"
         "  /backends          list available backends and current recommendations\n"
+        "  /context           show how much of the context window is used\n"
         "  /history [N]       show the last N conversation messages, default 8\n"
         "  /save [PATH]       save transcript JSON, default from --save-chat or chat_TIMESTAMP.json\n"
         "  /clear             clear the terminal screen\n"
@@ -749,12 +827,10 @@ def print_chat_help() -> None:
         "  /system TEXT       replace the system prompt and reset history\n"
     )
 
-
 def print_backends(current: str) -> None:
     for name in VALID_BACKENDS:
         marker = "*" if name == current else " "
         print(f"{marker} {name:10s} {BACKEND_NOTES[name]}")
-
 
 def print_status(
     *,
@@ -784,7 +860,6 @@ def print_status(
     print(f"history:     {turns} user turns, {assistant_turns} assistant turns")
     print(f"autosave:    {save_chat if save_chat else 'off'}")
 
-
 def print_history(messages: list[dict[str, str]], count: int) -> None:
     visible = [message for message in messages if message["role"] != "system"]
     if not visible:
@@ -793,7 +868,6 @@ def print_history(messages: list[dict[str, str]], count: int) -> None:
     for message in visible[-count:]:
         content = message["content"].replace("\n", "\n    ")
         print(f"{message['role']}: {content}")
-
 
 def save_transcript(
     path: Path,
@@ -818,11 +892,9 @@ def save_transcript(
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False) + "\n")
     return path
 
-
 def default_transcript_path() -> Path:
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     return ROOT / f"chat_{stamp}.json"
-
 
 def read_multiline_prompt() -> str:
     print("Enter multiline prompt. Finish with /end on its own line.")
@@ -838,7 +910,6 @@ def read_multiline_prompt() -> str:
         lines.append(line)
     return "\n".join(lines).strip()
 
-
 def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
     backend = args.backend
     max_tokens = args.max_tokens
@@ -851,6 +922,7 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
     }
     system_prompt = args.system
     messages: list[dict[str, str]] = [{"role": "system", "content": system_prompt}]
+    archived: list[dict[str, str]] = []
     native_server: PersistentNativeEngine | None = None
     stats_enabled = args.stats
     save_chat: Path | None = args.save_chat
@@ -868,6 +940,9 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
         nonlocal native_server
         if not args.persistent:
             return None
+        if native_server is not None and not native_server.is_alive():
+            print("[runtime] native engine exited; restarting it", file=sys.stderr)
+            native_server = None
         if native_server is None or native_server.backend != backend:
             if native_server is not None:
                 native_server.close()
@@ -929,6 +1004,9 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
                 if command == "/backends":
                     print_backends(backend)
                     continue
+                if command == "/context":
+                    print_context(tokenizer, messages, archived, max_tokens)
+                    continue
                 if command == "/history":
                     if value:
                         try:
@@ -951,7 +1029,7 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
                         backend=backend,
                         max_tokens=max_tokens,
                         sampling=sampling,
-                        messages=messages,
+                        messages=full_transcript(messages, archived),
                     )
                     save_chat = saved
                     print(f"saved transcript: {saved}")
@@ -962,6 +1040,7 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
                     continue
                 if command == "/reset":
                     messages = [{"role": "system", "content": system_prompt}]
+                    archived = []
                     if native_server is not None:
                         native_server.reset_session()
                     print("history reset")
@@ -975,10 +1054,13 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
                     continue
                 if command == "/temperature":
                     try:
-                        sampling["temperature"] = float(value)
+                        temperature = float(value)
                     except ValueError:
+                        temperature = -1.0
+                    if temperature < 0.0:
                         print("usage: /temperature 0.7")
                         continue
+                    sampling["temperature"] = temperature
                     print(f"temperature={sampling['temperature']}")
                     continue
                 if command == "/top-p":
@@ -1035,6 +1117,7 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
                         continue
                     system_prompt = value
                     messages = [{"role": "system", "content": system_prompt}]
+                    archived = []
                     if native_server is not None:
                         native_server.reset_session()
                     print("system prompt updated and history reset")
@@ -1044,6 +1127,25 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
                 continue
 
             messages.append({"role": "user", "content": user_text})
+            dropped = trim_to_context(tokenizer, messages, max_tokens)
+            if not fits_context(len(make_chat_tokens(tokenizer, messages)), max_tokens):
+                messages.pop()
+                first = first_turn_index(messages)
+                messages[first:first] = dropped
+                print(
+                    f"error: this message plus {max_tokens} reply tokens does not fit in the "
+                    f"{MAX_CONTEXT_TOKENS} token context; shorten it or lower /tokens",
+                    file=sys.stderr,
+                )
+                continue
+            if dropped:
+                archived.extend(dropped)
+                used = len(make_chat_tokens(tokenizer, messages))
+                print(
+                    f"[runtime] context window full; dropped the {len(dropped)} oldest messages "
+                    f"from context, now {used}/{MAX_CONTEXT_TOKENS} tokens "
+                    f"(still saved in the transcript)"
+                )
             try:
                 result = generate_turn(
                     tokenizer=tokenizer,
@@ -1064,6 +1166,13 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
                 messages.pop()
                 print(f"\nerror: {exc}", file=sys.stderr)
                 continue
+            except KeyboardInterrupt:
+                messages.pop()
+                if native_server is not None:
+                    native_server.close()
+                    native_server = None
+                print("\n[interrupted] reply discarded; Ctrl-C again at the prompt to quit")
+                continue
             messages.append({"role": "assistant", "content": result.text})
             if save_chat is not None:
                 try:
@@ -1073,7 +1182,7 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
                         backend=backend,
                         max_tokens=max_tokens,
                         sampling=sampling,
-                        messages=messages,
+                        messages=full_transcript(messages, archived),
                     )
                 except OSError as exc:
                     print(f"warning: could not save transcript: {exc}", file=sys.stderr)
@@ -1082,11 +1191,14 @@ def run_chat(args: argparse.Namespace, tokenizer, stop_ids: set[int]) -> None:
         if native_server is not None:
             native_server.close()
 
-
 def main() -> None:
     args = parse_args()
     if args.persistent is None:
         args.persistent = bool(args.chat)
+    if args.max_tokens <= 0:
+        raise SystemExit("--max-tokens must be positive")
+    if args.temperature < 0.0:
+        raise SystemExit("--temperature must be 0 or greater")
 
     if args.build:
         build_engine(args.engine_dir)
@@ -1116,7 +1228,41 @@ def main() -> None:
         {"role": "system", "content": args.system},
         {"role": "user", "content": user_prompt},
     ]
-    result = generate_turn(
+    prompt_length = len(make_chat_tokens(tokenizer, messages))
+    if not fits_context(prompt_length, args.max_tokens):
+        raise SystemExit(
+            f"Prompt is {prompt_length} tokens; with --max-tokens {args.max_tokens} it does not fit "
+            f"in the {MAX_CONTEXT_TOKENS} token context window."
+        )
+    try:
+        result = generate_one_shot(args, tokenizer, stop_ids, messages)
+    except RuntimeError as exc:
+        raise SystemExit(f"\nerror: {exc}") from exc
+    except KeyboardInterrupt:
+        raise SystemExit("\n[interrupted]") from None
+    if args.save_chat is not None:
+        messages.append({"role": "assistant", "content": result.text})
+        saved = save_transcript(
+            args.save_chat,
+            model=args.model,
+            backend=args.backend,
+            max_tokens=args.max_tokens,
+            sampling=one_shot_sampling(args),
+            messages=messages,
+        )
+        print(f"\n[chat] saved transcript: {saved}")
+
+def one_shot_sampling(args: argparse.Namespace) -> dict[str, float | int]:
+    return {
+        "temperature": args.temperature,
+        "top_k": args.top_k,
+        "top_p": args.top_p,
+        "repetition_penalty": args.repetition_penalty,
+        "seed": args.seed,
+    }
+
+def generate_one_shot(args: argparse.Namespace, tokenizer, stop_ids: set[int], messages) -> GenerationResult:
+    return generate_turn(
         tokenizer=tokenizer,
         messages=messages,
         stop_ids=stop_ids,
@@ -1127,33 +1273,9 @@ def main() -> None:
         no_stream=args.no_stream,
         show_token_ids=args.show_token_ids,
         print_runtime=args.stats,
-        sampling={
-            "temperature": args.temperature,
-            "top_k": args.top_k,
-            "top_p": args.top_p,
-            "repetition_penalty": args.repetition_penalty,
-            "seed": args.seed,
-        },
+        sampling=one_shot_sampling(args),
         warmup=args.warmup,
     )
-    if args.save_chat is not None:
-        messages.append({"role": "assistant", "content": result.text})
-        saved = save_transcript(
-            args.save_chat,
-            model=args.model,
-            backend=args.backend,
-            max_tokens=args.max_tokens,
-            sampling={
-                "temperature": args.temperature,
-                "top_k": args.top_k,
-                "top_p": args.top_p,
-                "repetition_penalty": args.repetition_penalty,
-                "seed": args.seed,
-            },
-            messages=messages,
-        )
-        print(f"\n[chat] saved transcript: {saved}")
-
 
 if __name__ == "__main__":
     main()

@@ -21,7 +21,6 @@ TIMING_RE = re.compile(
 )
 TOKENS_RE = re.compile(r"Generated continuation:\s*([0-9 ]+)")
 
-
 @dataclass
 class Measurement:
     engine: str
@@ -33,13 +32,11 @@ class Measurement:
     decode_tps: float
     output_tokens: list[int]
 
-
 def find_subsequence(sequence: list[int], needle: list[int]) -> int:
     for index in range(len(sequence) - len(needle) + 1):
         if sequence[index : index + len(needle)] == needle:
             return index
     raise ValueError("Could not locate marker inside the chat template")
-
 
 def make_prompt_tokens(tokenizer, target_length: int) -> list[int]:
     marker = "ZXQMARKERZXQ"
@@ -68,7 +65,6 @@ def make_prompt_tokens(tokenizer, target_length: int) -> list[int]:
     assert len(result) == target_length
     return result
 
-
 def benchmark_mlx(mx, generate_step, model, prompt: list[int], decode_tokens: int, repeat: int) -> Measurement:
     generator = generate_step(mx.array(prompt), model, max_tokens=decode_tokens)
     output: list[int] = []
@@ -94,7 +90,6 @@ def benchmark_mlx(mx, generate_step, model, prompt: list[int], decode_tokens: in
         decode_tps=(measured_decode_tokens / decode_seconds if decode_seconds else 0.0),
         output_tokens=output,
     )
-
 
 def benchmark_native(backend: str, prompt: list[int], decode_tokens: int, repeat: int) -> Measurement:
     command = [
@@ -133,10 +128,8 @@ def benchmark_native(backend: str, prompt: list[int], decode_tokens: int, repeat
         output_tokens=outputs,
     )
 
-
 def median(values: Iterable[float]) -> float:
     return statistics.median(values)
-
 
 def agreement(reference: list[int], candidate: list[int]) -> tuple[int, int | None]:
     matched = 0
@@ -149,7 +142,6 @@ def agreement(reference: list[int], candidate: list[int]) -> tuple[int, int | No
     if mismatch is None and len(reference) != len(candidate):
         mismatch = matched
     return matched, mismatch
-
 
 def print_summary(measurements: list[Measurement], contexts: list[int], engines: list[str]) -> None:
     print("\nMedian results (model/process loading excluded)")
@@ -176,7 +168,6 @@ def print_summary(measurements: list[Measurement], contexts: list[int], engines:
             status = "exact" if mismatch is None else f"first mismatch at generated token {mismatch}"
             print(f"  context {context:4d}: {matched:3d} matching tokens, {status}")
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--contexts", default="32,128,512,1024", help="comma-separated prompt lengths")
@@ -185,7 +176,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backends", default="mlx,fp16,int4", help="subset of mlx,fp16,int4,int8,int8-fp16,mixed,mps,hybrid")
     parser.add_argument("--json", type=Path, help="optional raw measurement output")
     return parser.parse_args()
-
 
 def main() -> None:
     args = parse_args()
@@ -232,7 +222,6 @@ def main() -> None:
     if args.json:
         args.json.write_text(json.dumps([asdict(item) for item in measurements], indent=2) + "\n")
         print(f"\nRaw results: {args.json}")
-
 
 if __name__ == "__main__":
     main()

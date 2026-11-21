@@ -1,0 +1,7 @@
+# Runtime: chat wrapper + fast local tokenizer
+tokenizers>=0.20
+# Weight export, quantization, and MLX reference comparisons
+mlx-lm>=0.31
+numpy>=2.0
+# Only needed for --tokenizer transformers and compare/benchmark scripts
+transformers>=4.45

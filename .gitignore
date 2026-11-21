@@ -41,3 +41,6 @@ chat_*.json
 INFERENCE_BACKENDS.md
 
 default.metallib
+
+# Stale prebuilt binary from an early prototype
+kernel/qwen_kernel/qwen_kernel/qwen_cpp

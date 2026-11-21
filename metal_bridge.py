@@ -2,7 +2,6 @@ import ctypes
 import numpy as np
 import os
 
-
 _dylib_path = os.path.join(os.path.dirname(__file__), "libmetal_kernels.dylib")
 
 if not os.path.exists(_dylib_path):
@@ -18,7 +17,6 @@ def _get_or_create_buffer(name, shape, dtype):
     if key not in _buffer_cache:
         _buffer_cache[key] = np.zeros(shape, dtype=dtype)
     return _buffer_cache[key]
-
 
 def gate_up_batched_reuse(gate_w, up_w, x):
     B, M, K = gate_w.shape
@@ -40,7 +38,6 @@ def gate_up_batched_reuse(gate_w, up_w, x):
     )
     return gate_out, up_out
 
-
 def down_batched_reuse(down_w, x):
     B, M, K = down_w.shape
     
@@ -58,7 +55,6 @@ def down_batched_reuse(down_w, x):
     return out
 
 _lib = ctypes.CDLL(_dylib_path)
-
 
 _lib.metal_init.restype = ctypes.c_int
 
@@ -90,7 +86,6 @@ def init():
         raise RuntimeError("Metal kernel initialization failed")
     print("✅ Metal kernels initialized")
 
-
 def gate_up_batched(gate_w: np.ndarray, up_w: np.ndarray, x: np.ndarray):
     B, M, K = gate_w.shape
 
@@ -113,7 +108,6 @@ def gate_up_batched(gate_w: np.ndarray, up_w: np.ndarray, x: np.ndarray):
     )
     
     return gate_out, up_out
-
 
 def down_batched(down_w: np.ndarray, x: np.ndarray):
     B, M, K = down_w.shape

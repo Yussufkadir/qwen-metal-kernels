@@ -1,8 +1,6 @@
 #include <metal_stdlib>
 using namespace metal;
 
-// One simdgroup computes ROWS output rows. Each lane reads 8 contiguous halfs
-// (16 bytes) per row per step, so a simdgroup reads 512 contiguous bytes of a row.
 template <uint ROWS, typename XT>
 inline void gemv_body(device const half* W, device const XT* x, device half* y,
                       uint M, uint K, uint row0, uint lane) {

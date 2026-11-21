@@ -1,343 +1,224 @@
-# Qwen Metal Local Inference Runtime
+# Qwen Metal
 
-Custom local Qwen inference runtime for Apple Silicon, written around Objective-C++ and Metal kernels. Project started as an optimization attempt of an qwen2.5-0.5b-instruct model but grew into more complex and detailed project with a usable terminal LLM runtime with KV cache reuse, persistent chat, startup optimization, benchmark tooling, and experimental quantized backends.
+A from-scratch LLM inference engine for Apple Silicon. It runs Qwen2.5-0.5B-Instruct on the GPU using hand-written Metal compute kernels and Objective-C++, with no ML framework in the inference path, and matches MLX's decode speed while producing identical tokens.
 
-The stable path is currently `fp16`. Quantized backends are kept for experimentation and measurement, but `fp16` is the recommended backend for normal local chat quality.
+```text
+$ ./qwen-local --chat --stats
+You: What is the capital of France?
+Assistant: The capital of France is Paris.
 
-## Current status
+You: And of Italy?
+Assistant: The capital of Italy is Rome.
 
-- Native Qwen2.5-0.5B-Instruct inference engine on Apple Silicon
-- Terminal one-shot generation and interactive chat wrapper
-- Persistent server mode for low latency multi turn chat
-- KV cache reuse across chat turns
-- Metal kernels for projection, attention, RMS norm, RoPE, MLP, sampling support paths, and fused hot path operations
-- Packed + mmap backed weight loading for much faster startup
-- Verification and benchmark scripts for comparing correctness, latency, cache behavior, and MLX reference behavior
-- FP16 stable backend plus experimental `int8`, `int8-fp16`, `int4`, `mixed`, `mps`, and `hybrid` backends
+[timing] prompt=0.1ms native=70.5ms first_token=22.1ms decode≈144.5 tok/s
+[cache] common=33 delta=14
+```
+
+## Highlights
+
+- **Framework-free inference.** Every transformer operation (projection, RMS norm, RoPE, grouped-query attention, MLP, argmax) is a Metal compute kernel written for this project.
+- **Decode speed on par with MLX.** 129–143 tokens/s against MLX's 126–139 tokens/s on the same model and machine.
+- **Verified correct.** Greedy output matches the MLX reference token for token (24/24 in the automated check).
+- **23 ms to first token** in multi-turn chat, by keeping the KV cache alive across turns and prefilling only the new part of the prompt.
+- **57 ms engine startup**, using a packed, memory-mapped weight file that Metal reads with zero copies.
+- **Seven backends** behind one interface, including INT8 and INT4 quantized paths, for measuring speed against quality.
+- **Tested and measured.** 72 automated tests, an end-to-end verifier, a benchmark suite with an MLX reference, a quantization evaluator, and per-kernel microbenchmarks.
+
+## Benchmarks
+
+Measured on an Apple M1 Pro with `benchmark_suite.py --include-mlx` (64 generated tokens, median of 3 runs).
+
+| Context (tokens) | Engine | Prefill (tokens/s) | Decode (tokens/s) |
+| ---: | --- | ---: | ---: |
+| 32 | MLX | 509 | 126 |
+| 32 | **This engine, FP16** | 165 | **129** |
+| 32 | This engine, INT8 | 107 | 142 |
+| 128 | MLX | 1520 | 139 |
+| 128 | **This engine, FP16** | 611 | **143** |
+| 128 | This engine, INT8 | 145 | 151 |
+| 512 | MLX | 3049 | 137 |
+| 512 | **This engine, FP16** | 1930 | **140** |
+| 512 | This engine, INT8 | 147 | 146 |
+
+| Latency | FP16 |
+| --- | ---: |
+| Native engine startup | 57 ms |
+| One-shot command, time to first token | 256 ms |
+| Chat turn with cached context, time to first token | 23 ms |
+
+Decode is slightly ahead of MLX. Prompt prefill is still slower than MLX, most visibly on short prompts, and the INT8 backend has no batched prefill yet.
+
+## How it works
+
+```mermaid
+flowchart LR
+    A[qwen-local<br/>Python chat CLI] -->|token ids over a line protocol| B[inference_engine<br/>Objective-C++]
+    B --> C[Batched prefill<br/>MPS matrix ops + tiled attention kernel]
+    B --> D[Single-token decode<br/>fused Metal kernels]
+    C --> E[(KV cache<br/>4096 tokens on GPU)]
+    D --> E
+    D --> F[GPU argmax<br/>or CPU sampling]
+    G[(weights.pack<br/>mmap, zero copy)] --> B
+```
+
+- **Chat front end** (`qwen_chat.py`, launched by `qwen-local`): tokenizes with a fast local BPE tokenizer, keeps the native engine running as a persistent process, and streams tokens back as they are generated.
+- **Native engine** (`qwen_engine.mm`): owns the Metal pipelines, the weights and the KV cache. In chat it compares each new prompt with what is already cached, keeps the shared prefix, and only processes the rest.
+- **Context window**: when a conversation reaches the 4096-token limit, the oldest turns are dropped until about half the window is free, so the cache is rebuilt once and the following turns are fast again. Dropped turns stay in the saved transcript, and `/context` shows current usage.
+- **Prefill**: the whole prompt delta is processed in one batch. Prompts of 512 tokens or more switch to a tiled attention kernel with online softmax.
+- **Decode**: one token per step through fused kernels (QKV projection, RoPE with cache append, gate/up activation). Attention uses a flash-decoding kernel that scores 32 cached tokens per thread group and merges blocks for long contexts.
+- **Sampling**: greedy argmax runs on the GPU; temperature, top-k, top-p and repetition penalty run on the CPU with a seedable generator.
+- **Weights**: exported from the Hugging Face model, optionally quantized group-wise to INT8 or INT4, then packed into one page-aligned file that is memory-mapped at startup.
 
 ## Quick start
 
-Build the native engine:
+Requirements: an Apple Silicon Mac, Xcode command line tools with the Metal toolchain, and Python 3.10 or newer.
 
 ```bash
-cd kernel/qwen_kernel/qwen_kernel
-./build_engine.sh
-cd ../../..
+python3 -m venv venv
+venv/bin/pip install -r requirements.txt
+venv/bin/python export_weights.py
+venv/bin/python quantize_weights.py --bits all
+venv/bin/python pack_weights.py --profile fp16
+(cd kernel/qwen_kernel/qwen_kernel && ./build_engine.sh)
 ```
 
-Run a one-shot prompt:
+`export_weights.py` downloads `Qwen/Qwen2.5-0.5B-Instruct` and writes FP16 tensors plus the tokenizer files, so nothing is read from the Hugging Face cache afterwards. The quantize step is only needed for the quantized backends. Rerun the pack step whenever the weight files change.
+
+Ask a single question:
 
 ```bash
-./qwen-local "Explain transformer KV cache in simple terms."
+./qwen-local "Explain a transformer KV cache in simple terms."
 ```
 
-By default, `qwen-local` uses a lightweight local Qwen tokenizer path for the default model. This avoids importing the full Transformers stack on every one-shot command. If you need the original Hugging Face tokenizer path for debugging, use:
-
-```bash
-./qwen-local --tokenizer transformers "Explain transformer KV cache in simple terms."
-```
-
-Start interactive chat:
+Start an interactive chat:
 
 ```bash
 ./qwen-local --chat
 ```
 
-Or just run the local command with no prompt from an interactive terminal:
+Useful options:
+
+| Option | Effect |
+| --- | --- |
+| `--backend fp16` | Choose a backend (see below) |
+| `--stats` | Print timing and cache reuse after each reply |
+| `-n 128` | Maximum tokens to generate |
+| `--temperature 0.7 --top-p 0.9` | Enable sampling |
+| `--save-chat chat.json` | Save the transcript |
+
+Inside the chat, `/help` lists the commands: `/status`, `/backend`, `/tokens`, `/temperature`, `/top-p`, `/top-k`, `/repeat`, `/seed`, `/system`, `/context`, `/history`, `/multi`, `/save`, `/reset`, `/stats`, `/exit`.
+
+## Backends
+
+| Backend | What it is | Status |
+| --- | --- | --- |
+| `fp16` | Half-precision Metal kernels with batched prefill | Stable, the default |
+| `int8` | 8-bit group-quantized weights | Experimental, slightly faster decode |
+| `int8-fp16` | INT8 body with an FP16 output head | Experimental |
+| `int4` | 4-bit group-quantized weights | Experimental, quality is not reliable |
+| `mixed` | INT4 body with an FP16 output head | Experimental |
+| `hybrid` | FP16 batched prefill with INT4 decode | Experimental |
+| `mps` | Apple MPS matrix operations | Comparison baseline |
+
+## Tests
 
 ```bash
-./qwen-local
+venv/bin/python -m unittest discover tests
 ```
 
-Useful chat commands:
+The suite uses only the standard library test runner and takes about 20 seconds.
 
-```text
-/help
-/status
-/backends
-/history
-/multi
-/save chat.json
-/reset
-/tokens 128
-/temperature 0.7
-/top-p 0.9
-/stats on
-/stats off
-/backend fp16
-/exit
-```
+| File | What it covers |
+| --- | --- |
+| `tests/test_context.py` | Context window budgeting and trimming of old turns |
+| `tests/test_tokenizer.py` | Chat template, special tokens, round trips, and exact agreement with the Hugging Face tokenizer |
+| `tests/test_weights.py` | INT8/INT4 quantization error bounds and the packed weight format |
+| `tests/test_engine.py` | The native engine: argument errors, deterministic and seeded generation, agreement between backends and kernel variants, KV cache reuse, and recovery from bad requests |
 
-## Stable local LLM path
+Engine tests are skipped automatically when the engine binary or weights are missing, which is how the GitHub Actions workflow runs them on a machine without a GPU.
 
-The intended daily use path is:
+## Verification and benchmarking
+
+Run the end-to-end verifier. It rebuilds the engine, then checks generation, the chat wrapper, KV cache reuse, session latency, token agreement with MLX, and benchmark output:
 
 ```bash
-./qwen-local --chat --backend fp16
+venv/bin/python verify_engine.py --backend fp16 --compare-tokens 24 --benchmark-tokens 24 --benchmark-contexts 32,128 --benchmark-repeats 1 --session-turns 4 --session-tokens 32 --timeout 240
 ```
 
-In chat mode the wrapper keeps the native engine loaded by default. That avoids paying engine startup on every turn and lets the runtime reuse the KV cache when the conversation grows normally. The persistent runtime also performs a 32 token GPU prefill warmup before reporting that it is ready. This moves MPS pipeline initialization out of the first user turn.
-
-To measure the unwarmed first request:
+Reproduce the benchmark table:
 
 ```bash
-./qwen-local --chat --no-gpu-warmup --stats
+venv/bin/python benchmark_suite.py --include-mlx --backends fp16,int8 --contexts 32,128,512 --tokens 64 --repeats 3 --warmups 1
 ```
 
-For timing output:
+Measure how closely the quantized backends follow FP16:
 
 ```bash
-./qwen-local --chat --stats
+venv/bin/python quantization_eval.py --backends int8,int8-fp16,int4 --tokens 64
 ```
 
-For a single prompt with timing:
-
-```bash
-./qwen-local --stats -n 128 "Explain KV cache in three bullet points."
-```
-
-Optional warm start mode:
-
-```bash
-./qwen-local --warmup --stats "Explain KV cache simply."
-```
-
-`--warmup` pre touches the mmap backed weights during native startup. This intentionally moves some page fault cost into startup. It can be useful when testing cold start behavior, but it is not the default because on an already warm OS file cache it can make one-shot latency worse.
-
-Save a one-shot transcript:
-
-```bash
-./qwen-local --save-chat chat.json "Explain KV cache simply."
-```
-
-Autosave an interactive chat transcript:
-
-```bash
-./qwen-local --chat --save-chat chat.json
-```
-
-## Weight loading
-
-The fastest startup path uses a packed weight archive:
-
-```bash
-python3 pack_weights.py --profile fp16
-```
-
-This creates ignored local runtime files under:
-
-```text
-kernel/qwen_kernel/qwen_kernel/qwen_weights/weights.pack
-kernel/qwen_kernel/qwen_kernel/qwen_weights/weights.index
-```
-
-The engine memory maps the pack file and creates Metal buffers from the mapped weight ranges when possible. This reduces cold engine startup substantially compared with opening hundreds of loose weight files.
-
-## Verification
-
-Run the main verification suite:
-
-```bash
-venv/bin/python verify_engine.py \
-  --backend fp16 \
-  --compare-tokens 24 \
-  --benchmark-tokens 24 \
-  --benchmark-contexts 32,128 \
-  --benchmark-repeats 1 \
-  --session-turns 4 \
-  --session-tokens 32 \
-  --timeout 240
-```
-
-The verifier checks:
-
-- native engine smoke generation
-- Python chat wrapper
-- persistent KV cache reuse
-- session latency
-- MLX token comparison
-- benchmark output
-
-## Benchmarking
-
-Run the reliable benchmark suite:
-
-```bash
-venv/bin/python benchmark_suite.py \
-  --backends fp16,int8 \
-  --contexts 32,128,512 \
-  --tokens 64 \
-  --repeats 3 \
-  --warmups 1 \
-  --session-turns 4 \
-  --session-tokens 32
-```
-
-Compare the same suite with weight warmup enabled:
-
-```bash
-venv/bin/python benchmark_suite.py \
-  --backends fp16 \
-  --contexts 32,128 \
-  --tokens 32 \
-  --repeats 1 \
-  --weight-warmup
-```
-
-This reports separate medians for:
-
-- core native prefill/decode speed
-- native engine startup
-- one-shot wrapper latency
-- persistent chat/session latency
-- KV cache reuse across turns
-
-The suite also writes raw rows to an ignored `benchmark_*.json` file for later comparison or plotting.
-
-Persistent session measurements use GPU prefill warmup by default. Use `--no-session-gpu-warmup` to expose the raw first use cost. Core and one-shot measurements are never GPU warmed unless explicitly launched through the native `--gpu-warmup` option.
-
-Single token decode attention uses `gqa_decode_attention`, a flash decoding kernel: each threadgroup scores 32 cached tokens at once with a per slot online softmax, and contexts over 256 tokens are split into blocks merged by `gqa_attention_block_reduce`. To A/B it against the previous fused/blockwise kernels:
-
-```bash
-QWEN_FLASH_DECODE=0 ./kernel/qwen_kernel/qwen_kernel/inference_engine --backend fp16 -n 128 <token ids...>
-```
-
-Developer switches for the native engine:
-
-- `QWEN_GPU_TIMING=1` prints per decode step wall time, GPU time, and the CPU + sync overhead between them.
-- `QWEN_METAL_SOURCE_DIR=<dir>` compiles `kernels.metal` and `optimized_kernels.metal` from `<dir>` at startup instead of loading `default.metallib`. Useful for kernel iteration, or when the offline Metal toolchain is not installed.
-
-Standalone kernel microbenchmarks live in `kernel/bench/`.
-
-To compare the optimized decode attention path with the original three pass implementation:
-
-```bash
-QWEN_FUSED_ATTENTION=0 venv/bin/python benchmark_suite.py \
-  --backends fp16 \
-  --contexts 512,1024,2048 \
-  --tokens 32 \
-  --repeats 3 \
-  --skip-startup \
-  --skip-oneshot \
-  --skip-session
-```
-
-Long-context decode switches from independent query head blocks to paired GQA blocks once attention reaches 14 blocks. To disable that adaptive path for an A/B run:
-
-```bash
-QWEN_GROUPED_GQA=0 venv/bin/python benchmark_suite.py \
-  --backends fp16 \
-  --contexts 3200,3456,3968 \
-  --tokens 32 \
-  --repeats 3 \
-  --skip-startup \
-  --skip-oneshot \
-  --skip-session
-```
-
-Prefill attention switches to an 8 query by 32 key SIMD matrix tiled kernel for prompt deltas of at least 512 tokens. Both QK scores and probability by value accumulation use 8 by 8 SIMD group matrix operations, with online softmax between them. To compare it with the score matrix three pass path:
-
-```bash
-QWEN_TILED_PREFILL=0 venv/bin/python benchmark_suite.py \
-  --backends fp16 \
-  --contexts 512,1024,2048,3072 \
-  --tokens 32 \
-  --repeats 3 \
-  --skip-startup \
-  --skip-oneshot \
-  --skip-session
-```
-
-The equivalent native engine switch is `--legacy-prefill-attention`.
-
-To compare combined prefill matrices with the original separate MPS launches:
-
-```bash
-QWEN_COMBINED_PREFILL=0 venv/bin/python benchmark_suite.py \
-  --backends fp16 \
-  --contexts 128,512,1024 \
-  --tokens 32 \
-  --repeats 3 \
-  --skip-startup \
-  --skip-oneshot \
-  --skip-session
-```
-
-To include an MLX core decode reference:
-
-```bash
-venv/bin/python benchmark_suite.py \
-  --include-mlx \
-  --backends fp16 \
-  --contexts 32,128,512 \
-  --tokens 64 \
-  --repeats 3
-```
-
-Run decode benchmarks:
-
-```bash
-venv/bin/python benchmark_real.py \
-  --backends fp16,int8 \
-  --contexts 32,128 \
-  --tokens 64 \
-  --repeats 3
-```
-
-Compare native output against MLX:
+Compare a full reply against MLX:
 
 ```bash
 venv/bin/python compare_chat.py --backend fp16 -n 80
 ```
 
-Evaluate quantized backends against native FP16 behavior:
+### Developer switches
 
-```bash
-venv/bin/python quantization_eval.py \
-  --backends int8,int8-fp16,int4 \
-  --tokens 64
-```
+Each optimized path can be turned off to measure it against the version it replaced.
 
-This measures generated token prefix agreement against the FP16 backend. It is a quantization health check: high agreement means the quantized backend is preserving FP16 behavior; low agreement means quantization is changing token choices early.
+| Switch | Effect |
+| --- | --- |
+| `QWEN_FLASH_DECODE=0` | Use the earlier fused/blockwise decode attention |
+| `QWEN_FUSED_ATTENTION=0` | Use the original three-pass decode attention |
+| `QWEN_GROUPED_GQA=0` | Disable paired GQA blocks for long contexts |
+| `QWEN_TILED_PREFILL=0` or `--legacy-prefill-attention` | Use score-matrix prefill attention |
+| `QWEN_COMBINED_PREFILL=0` | Use separate MPS launches for prefill matrices |
+| `QWEN_GPU_TIMING=1` | Print wall time, GPU time and overhead per decode step |
+| `QWEN_METAL_SOURCE_DIR=<dir>` | Compile the `.metal` sources at startup instead of loading `default.metallib` |
+| `--warmup` | Pre-touch the mapped weights at startup |
+| `--no-gpu-warmup` | Skip the chat-mode prefill warmup to expose first-use cost |
 
-## Backend notes
+## Optimization work
 
-| Backend | Intended use | Current recommendation |
-| --- | --- | --- |
-| `fp16` | Stable local chat and correctness testing | Use by default |
-| `int8` | Speed/memory experiments | Promising, keep testing quality |
-| `int8-fp16` | INT8 transformer body with FP16 LM head | Experimental stable-lite candidate |
-| `int4` | Aggressive compression experiments | Fast but quality is not reliable enough yet |
-| `mixed` | INT4 body with FP16 LM head experiment | Experimental |
-| `mps` | Apple MPS comparison path | Useful for comparison, not the main optimized path |
-| `hybrid` | Experimental mixed execution path | Experimental |
+- KV cache reuse for decode and across chat turns
+- Batched prefill of only the new part of each prompt
+- Zero-copy combined QKV and gate/up prefill matrices
+- Fused kernels: QKV projection, RoPE with cache append, gate/up activation
+- Flash-decoding attention with per-block online softmax and block merge
+- Paired grouped-query attention near the 4096-token limit
+- SIMD-group matrix tiled prefill attention for long prompts
+- Two-stage GPU argmax
+- Packed, page-aligned, memory-mapped weights wrapped directly as Metal buffers
+- Backend-specific pipeline loading and a prefill warmup that moves first-use cost out of the first chat turn
+- A lightweight tokenizer path that avoids importing Transformers for one-shot commands
 
-## What was optimized
+## Repository layout
 
-The main engineering wins so far:
+| Path | Contents |
+| --- | --- |
+| `qwen-local`, `qwen_chat.py` | Chat and one-shot command line front end |
+| `kernel/qwen_kernel/qwen_kernel/qwen_engine.mm`, `qwen_engine.h` | The inference engine and its C API |
+| `kernel/qwen_kernel/qwen_kernel/main_cli.mm` | Native CLI and persistent server mode |
+| `kernel/qwen_kernel/qwen_kernel/kernels.metal`, `optimized_kernels.metal` | Metal compute kernels |
+| `export_weights.py`, `quantize_weights.py`, `pack_weights.py` | Weight export, quantization and packing |
+| `tests/` | Automated tests |
+| `verify_engine.py`, `benchmark_suite.py`, `benchmark_real.py`, `compare_chat.py`, `quantization_eval.py` | Verification and measurement tools |
+| `kernel/bench/` | Standalone kernel microbenchmarks |
+| `baseline.py`, `benchmark_qwen.py`, `metal_bridge.py`, `qwen_patched.py`, `qwen_test.py`, `bridge.mm`, `inference.mm`, `main.mm` | Early prototypes, kept for history |
 
-- KV cache reuse for decode and persistent chat
-- batched prompt delta prefill for cached sessions
-- zero copy combined QKV and gate/up prefill matrices
-- fused QKV split/bias and gate/up activation kernels
-- SIMD group matrix QK and probability by value tiled prefill for prompt deltas of at least 512 tokens
-- fused FP16 QKV projection
-- fused RoPE plus KV cache append for single token decode
-- context adaptive fused and blockwise decode attention
-- paired grouped query attention near the 4096 token cache limit
-- GPU greedy argmax path
-- backend specific pipeline loading
-- direct Metal buffer weight loading
-- packed + mmap backed weights
-- fast local tokenizer path for terminal one shot usage
-- persistent GPU prefill warmup for low first turn latency
-- startup timing instrumentation
-- session latency verification
+## Limitations
 
-## Honest limitations
+- Built for one model. Dimensions, vocabulary size and layer count are fixed for Qwen2.5-0.5B-Instruct.
+- The context window is 4096 tokens. Older turns are dropped rather than summarized, so the model forgets them.
+- Prefill is slower than MLX, and the quantized backends prefill one token at a time.
+- INT4 quantization changes the model's output early; INT8 follows FP16 more closely but is only slightly faster.
+- The `mps` backend has no persistent KV cache and recomputes the full prompt each turn.
+- The engine tests need an Apple GPU and the weights, so CI only runs the chat template, context and weight-format tests.
+- It is a command line tool by design; there is no HTTP server.
 
-This is a custom learning/runtime project, not a replacement for mature engines like MLX or llama.cpp across every workload.
+This is a learning and systems project, not a replacement for MLX or llama.cpp. Its value is that the whole inference stack is visible and measured: kernels, memory layout, dispatch overhead, cache behavior, startup cost and backend trade-offs.
 
-The native FP16 path is in the same rough short context decode speed class as MLX on the tested small model, but mature frameworks still have advantages in generality, long context behavior, quality preserving quantization, model coverage, and production hardening.
+## License
 
-The project is strongest as a systems portfolio piece because it exposes the inference stack directly: kernels, memory layout, dispatch overhead, KV cache behavior, startup cost, backend tradeoffs, and measurement discipline.
+MIT. See [LICENSE](LICENSE). The model weights are downloaded separately and are covered by Qwen's own license.

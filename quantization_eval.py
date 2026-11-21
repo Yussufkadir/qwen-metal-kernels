@@ -10,13 +10,11 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent
 ENGINE_DIR = ROOT / "kernel/qwen_kernel/qwen_kernel"
 ENGINE = ENGINE_DIR / "inference_engine"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 GENERATED_RE = re.compile(r"Generated continuation:\s*([0-9 ]+)")
-
 
 DEFAULT_PROMPTS = [
     "Explain transformer KV cache in 3 technically correct bullet points.",
@@ -25,7 +23,6 @@ DEFAULT_PROMPTS = [
     "Write a Python function that returns the factorial of n.",
     "Summarize this in one sentence: Metal kernels reduce dispatch and memory overhead when operations are fused.",
 ]
-
 
 @dataclass
 class QuantEvalRow:
@@ -40,7 +37,6 @@ class QuantEvalRow:
     agreement_ratio: float
     first_mismatch: int | None
     decoded: str
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Compare quantized native backends against FP16 output.")
@@ -58,14 +54,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--timeout", type=float, default=180.0)
     return parser.parse_args()
 
-
 def normalize_token_ids(value) -> list[int]:
     if isinstance(value, dict) and "input_ids" in value:
         return [int(token) for token in value["input_ids"]]
     if hasattr(value, "input_ids"):
         return [int(token) for token in value.input_ids]
     return [int(token) for token in value]
-
 
 def load_tokenizer(model_name: str, allow_download: bool):
     from transformers import AutoTokenizer
@@ -75,7 +69,6 @@ def load_tokenizer(model_name: str, allow_download: bool):
         trust_remote_code=True,
         local_files_only=not allow_download,
     )
-
 
 def make_prompt_tokens(tokenizer, system_prompt: str, prompt: str) -> list[int]:
     templated = tokenizer.apply_chat_template(
@@ -87,7 +80,6 @@ def make_prompt_tokens(tokenizer, system_prompt: str, prompt: str) -> list[int]:
         add_generation_prompt=True,
     )
     return normalize_token_ids(templated)
-
 
 def generate_native(
     engine: Path,
@@ -124,7 +116,6 @@ def generate_native(
         raise RuntimeError(f"could not parse {backend} output:\n{result.stdout}")
     return [int(token) for token in match.group(1).split()], elapsed
 
-
 def first_mismatch(reference: list[int], candidate: list[int]) -> tuple[int, int | None]:
     matched = 0
     mismatch = None
@@ -137,13 +128,11 @@ def first_mismatch(reference: list[int], candidate: list[int]) -> tuple[int, int
         mismatch = matched
     return matched, mismatch
 
-
 def read_prompts(path: Path | None) -> list[str]:
     if path is None:
         return DEFAULT_PROMPTS
     prompts = [line.strip() for line in path.read_text().splitlines()]
     return [prompt for prompt in prompts if prompt and not prompt.startswith("#")]
-
 
 def main() -> int:
     args = parse_args()
@@ -227,7 +216,6 @@ def main() -> int:
         args.json.write_text(json.dumps([asdict(row) for row in rows], indent=2) + "\n")
         print(f"\nRaw results: {args.json}")
     return 0
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

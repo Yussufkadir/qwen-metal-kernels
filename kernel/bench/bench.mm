@@ -11,7 +11,6 @@ int main(int argc, char** argv){ @autoreleasepool {
   id<MTLDevice> dev = MTLCreateSystemDefaultDevice();
   id<MTLCommandQueue> q = [dev newCommandQueue];
   std::string src = slurp(argv[1]) + "\n" + slurp(argv[2]) + "\n" + slurp(argv[3]);
-  // strip duplicate headers
   NSError* err=nil;
   id<MTLLibrary> lib = [dev newLibraryWithSource:[NSString stringWithUTF8String:src.c_str()] options:nil error:&err];
   if(!lib){ printf("%s\n", err.localizedDescription.UTF8String); return 1; }

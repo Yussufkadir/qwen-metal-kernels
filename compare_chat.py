@@ -7,13 +7,11 @@ import subprocess
 import time
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent
 ENGINE_DIR = ROOT / "kernel/qwen_kernel/qwen_kernel"
 ENGINE = ENGINE_DIR / "inference_engine"
 MODEL_NAME = "Qwen/Qwen2.5-0.5B-Instruct"
 GENERATED_RE = re.compile(r"Generated continuation:\s*([0-9 ]+)")
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
@@ -28,14 +26,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--show-token-ids", action="store_true")
     return parser.parse_args()
 
-
 def normalize_token_ids(value) -> list[int]:
     if isinstance(value, dict) and "input_ids" in value:
         return [int(token) for token in value["input_ids"]]
     if hasattr(value, "input_ids"):
         return [int(token) for token in value.input_ids]
     return [int(token) for token in value]
-
 
 def load_transformers_tokenizer(model_name: str, allow_download: bool):
     from transformers import AutoTokenizer
@@ -45,7 +41,6 @@ def load_transformers_tokenizer(model_name: str, allow_download: bool):
         trust_remote_code=True,
         local_files_only=not allow_download,
     )
-
 
 def make_prompt_tokens(tokenizer, system_prompt: str, user_prompt: str) -> list[int]:
     templated = tokenizer.apply_chat_template(
@@ -58,10 +53,8 @@ def make_prompt_tokens(tokenizer, system_prompt: str, user_prompt: str) -> list[
     )
     return normalize_token_ids(templated)
 
-
 def decode(tokenizer, tokens: list[int]) -> str:
     return tokenizer.decode(tokens, skip_special_tokens=True)
-
 
 def first_mismatch(left: list[int], right: list[int]) -> tuple[int, int | None]:
     matched = 0
@@ -74,7 +67,6 @@ def first_mismatch(left: list[int], right: list[int]) -> tuple[int, int | None]:
     if mismatch is None and len(left) != len(right):
         mismatch = matched
     return matched, mismatch
-
 
 def generate_mlx(model_name: str, prompt_tokens: list[int], max_tokens: int) -> tuple[list[int], float]:
     import mlx.core as mx
@@ -90,7 +82,6 @@ def generate_mlx(model_name: str, prompt_tokens: list[int], max_tokens: int) -> 
             break
     elapsed = time.perf_counter() - start
     return output, elapsed
-
 
 def generate_native(
     engine: Path,
@@ -124,7 +115,6 @@ def generate_native(
     if not match:
         raise RuntimeError(f"Could not parse native output:\n{result.stdout}")
     return [int(token) for token in match.group(1).split()], elapsed, result.stdout
-
 
 def main() -> None:
     args = parse_args()
@@ -174,7 +164,6 @@ def main() -> None:
         end = mismatch + 8
         print(f"MLX window:    {mlx_tokens[start:end]}")
         print(f"Native window: {native_tokens[start:end]}")
-
 
 if __name__ == "__main__":
     main()

@@ -9,7 +9,6 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
-
 ROOT = Path(__file__).resolve().parent
 ENGINE_DIR = ROOT / "kernel/qwen_kernel/qwen_kernel"
 ENGINE = ENGINE_DIR / "inference_engine"
@@ -24,7 +23,6 @@ TIMING_RE = re.compile(
 AGREEMENT_RE = re.compile(r"Agreement:\s+(\d+)/(\d+)\s+matching,\s+(.*)")
 BENCH_RE = re.compile(r"^\s*(\d+)\s+([\w-]+)\s+([0-9.]+)\s+([0-9.]+)\s+([0-9.]+)\s*$", re.MULTILINE)
 
-
 @dataclass
 class CheckResult:
     name: str
@@ -32,7 +30,6 @@ class CheckResult:
     elapsed: float
     detail: str
     output: str = ""
-
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
@@ -54,7 +51,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--verbose", action="store_true")
     return parser.parse_args()
 
-
 def run_command(
     command: list[str],
     *,
@@ -75,12 +71,10 @@ def run_command(
     )
     return result.returncode, result.stdout, time.perf_counter() - started
 
-
 def finish(name: str, passed: bool, elapsed: float, detail: str, output: str = "") -> CheckResult:
     status = "PASS" if passed else "FAIL"
     print(f"[{status}] {name}: {detail} ({elapsed:.2f}s)")
     return CheckResult(name, passed, elapsed, detail, output)
-
 
 def check_build(args: argparse.Namespace) -> CheckResult:
     if args.no_build:
@@ -92,7 +86,6 @@ def check_build(args: argparse.Namespace) -> CheckResult:
     detail = "engine built" if passed else "build failed"
     return finish("build", passed, elapsed, detail, output)
 
-
 def check_native_smoke(args: argparse.Namespace) -> CheckResult:
     if not ENGINE.exists():
         return finish("native smoke", False, 0.0, "engine binary missing")
@@ -101,7 +94,6 @@ def check_native_smoke(args: argparse.Namespace) -> CheckResult:
     passed = code == 0 and "Generated continuation:" in output
     detail = "native engine generated one token" if passed else "native engine failed"
     return finish("native smoke", passed, elapsed, detail, output)
-
 
 def check_chat_smoke(args: argparse.Namespace) -> CheckResult:
     command = [
@@ -121,7 +113,6 @@ def check_chat_smoke(args: argparse.Namespace) -> CheckResult:
     passed = code == 0 and generated > 0 and "Assistant:" in output
     detail = f"generated_tokens={generated}" if passed else "chat wrapper failed"
     return finish("chat smoke", passed, elapsed, detail, output)
-
 
 def check_persistent_cache(args: argparse.Namespace) -> CheckResult:
     command = [
@@ -147,7 +138,6 @@ def check_persistent_cache(args: argparse.Namespace) -> CheckResult:
         detail = "no cache rows found"
     return finish("persistent cache", passed, elapsed, detail, output)
 
-
 def check_compare(args: argparse.Namespace) -> CheckResult:
     if args.skip_compare:
         return finish("mlx compare", True, 0.0, "skipped")
@@ -168,7 +158,6 @@ def check_compare(args: argparse.Namespace) -> CheckResult:
     passed = code == 0 and matched > 0
     detail = f"agreement={matched}/{total}" if match else "agreement line missing"
     return finish("mlx compare", passed, elapsed, detail, output)
-
 
 def check_benchmark(args: argparse.Namespace) -> CheckResult:
     if args.skip_benchmark:
@@ -194,7 +183,6 @@ def check_benchmark(args: argparse.Namespace) -> CheckResult:
     else:
         detail = "benchmark summary missing"
     return finish("benchmark", passed, elapsed, detail, output)
-
 
 def check_session_latency(args: argparse.Namespace) -> CheckResult:
     if args.skip_session_benchmark:
@@ -261,7 +249,6 @@ def check_session_latency(args: argparse.Namespace) -> CheckResult:
         detail = f"timings={len(timings)}, cache_rows={len(cache_rows)}, reused={len(reused_rows)}"
     return finish("session latency", passed, elapsed, detail, output)
 
-
 def print_failure_logs(results: list[CheckResult], verbose: bool) -> None:
     for result in results:
         if result.passed and not verbose:
@@ -271,7 +258,6 @@ def print_failure_logs(results: list[CheckResult], verbose: bool) -> None:
         print()
         print(f"===== {result.name} output =====")
         print(result.output.rstrip())
-
 
 def main() -> int:
     args = parse_args()
@@ -305,7 +291,6 @@ def main() -> int:
     print(f"Summary: {passed}/{len(results)} checks passed")
     print_failure_logs(results, args.verbose)
     return 0 if passed == len(results) else 1
-
 
 if __name__ == "__main__":
     raise SystemExit(main())

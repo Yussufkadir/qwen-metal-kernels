@@ -10,7 +10,6 @@ VOCAB = 151936
 GROUP_SIZE = 64
 ROWS_PER_CHUNK = 256
 
-
 def projection_shapes():
     yield "lm_head.weight", VOCAB, HIDDEN
     for layer in range(NUM_LAYERS):
@@ -22,7 +21,6 @@ def projection_shapes():
         yield f"{p}.mlp.gate_proj.weight", INTERMEDIATE, HIDDEN
         yield f"{p}.mlp.up_proj.weight", INTERMEDIATE, HIDDEN
         yield f"{p}.mlp.down_proj.weight", HIDDEN, INTERMEDIATE
-
 
 def quantize_q4_file(weights_dir: Path, name: str, rows: int, columns: int) -> tuple[int, int]:
     source = weights_dir / f"{name}.bin"
@@ -49,7 +47,6 @@ def quantize_q4_file(weights_dir: Path, name: str, rows: int, columns: int) -> t
 
     return packed_path.stat().st_size, scales_path.stat().st_size
 
-
 def quantize_q8_file(weights_dir: Path, name: str, rows: int, columns: int) -> tuple[int, int]:
     source = weights_dir / f"{name}.bin"
     quant_path = weights_dir / f"{name}.q8.bin"
@@ -73,13 +70,11 @@ def quantize_q8_file(weights_dir: Path, name: str, rows: int, columns: int) -> t
 
     return quant_path.stat().st_size, scales_path.stat().st_size
 
-
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("weights_dir", nargs="?", default="kernel/qwen_kernel/qwen_kernel/qwen_weights")
     parser.add_argument("--bits", choices=["4", "8", "all"], default="4")
     return parser.parse_args()
-
 
 def main() -> None:
     args = parse_args()
@@ -104,7 +99,6 @@ def main() -> None:
         print(f"FP16 projections: {fp16_bytes / 1e6:.1f} MB")
         print(f"{label} projections: {total_bytes / 1e6:.1f} MB")
         print(f"Compression:       {fp16_bytes / total_bytes:.2f}x")
-
 
 if __name__ == "__main__":
     main()
